@@ -604,8 +604,10 @@ const CSS = `
   border-bottom:1px solid #2a2f3a;background:#1b1f27;}
 .mml-tmtitle{flex:1;min-width:0;font-size:calc(12px * var(--mml-fs, 1));color:#dde2ea;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;}
-.mml-tmstage{position:relative;background:#000;line-height:0;}
-.mml-tmvideo{width:100%;max-height:340px;object-fit:contain;display:block;}
+.mml-tmstage{position:relative;height:340px;max-height:55vh;background:#000;
+  line-height:0;overflow:hidden;}
+.mml-tmvideo{position:absolute;left:50%;top:50%;max-width:none;max-height:none;
+  object-fit:contain;display:block;transform-origin:center center;}
 .mml-tmcropwrap{position:absolute;inset:0;}
 
 .mml-tmcrop{position:absolute;border:1.5px dashed #4cc3e0;cursor:move;
@@ -1239,10 +1241,7 @@ class TrimModal {
           onmousedown: (e) => { e.stopPropagation(); this.cropDown(e, c); } })));
     this.cropBox = el("div", { class: "mml-cropbox" }, this.cropRect);
     this.cropWrap = el("div", { class: "mml-tmcropwrap" }, this.cropBox);
-    requestAnimationFrame(() => {
-      this.stopFit = fitToMedia(this.media, this.cropBox,
-                                this.item.width, this.item.height);
-    });
+    requestAnimationFrame(() => this.refitMedia());
     this.cropInfo = el("span", { class: "mml-tmcropinfo" });
     this.rotBtn = el("button", { class: "mml-btn mml-sm",
       title: "Rotate 90\u00b0 clockwise (shift-click for anticlockwise)",
@@ -1389,18 +1388,21 @@ class TrimModal {
   }
 
   /** Turn the preview and re-fit the crop overlay to the new bounds. */
+  refitMedia() {
+    if (!this.stage || !this.media || !this.cropBox) return;
+    if (this.stopFit) this.stopFit();
+    this.stopFit = fitEditorMedia(
+      this.stage, this.media, this.cropBox,
+      this.item.width, this.item.height, this.rotate
+    );
+  }
+
   syncRotate() {
     if (this.media) {
       this.media.style.transform =
-        `${this.mirror ? "scaleX(-1) " : ""}rotate(${this.rotate}deg)`;
-      // A quarter turn means the drawn box swaps its sides; re-measure.
-      if (this.cropBox) {
-        requestAnimationFrame(() => {
-          const [w, h] = this.visualSize();
-          if (this.stopFit) this.stopFit();
-          this.stopFit = fitToMedia(this.media, this.cropBox, w, h);
-        });
-      }
+        `translate(-50%, -50%) ${this.mirror ? "scaleX(-1) " : ""}` +
+        `rotate(${this.rotate}deg)`;
+      requestAnimationFrame(() => this.refitMedia());
     }
     if (this.rotBtn) {
       this.rotBtn.classList.toggle("on", !!this.rotate);
@@ -1412,7 +1414,8 @@ class TrimModal {
   syncMirror() {
     if (this.media) {
       this.media.style.transform =
-        `${this.mirror ? "scaleX(-1) " : ""}rotate(${this.rotate || 0}deg)`;
+        `translate(-50%, -50%) ${this.mirror ? "scaleX(-1) " : ""}` +
+        `rotate(${this.rotate || 0}deg)`;
     }
     if (this.mirrorBtn) this.mirrorBtn.classList.toggle("on", this.mirror);
   }
@@ -1636,8 +1639,8 @@ class TrimModal {
     const isStill = this.isStill;
     // Pictures need the stage too — it holds the image and the crop overlay.
     const stage = (isVid || isStill)
-      ? el("div", { class: "mml-tmstage" }, this.media,
-          (this.cropUI = this.buildCrop(), this.cropWrap))
+      ? (this.stage = el("div", { class: "mml-tmstage" }, this.media,
+          (this.cropUI = this.buildCrop(), this.cropWrap)))
       : null;
 
     const chips = [2, 3].map((secs) =>
@@ -1837,6 +1840,44 @@ function fitToMedia(mediaEl, boxEl, natW, natH) {
     return () => { ro.disconnect(); if (mediaEl._mmlFitRO === ro) mediaEl._mmlFitRO = null; };
   }
   return () => {};
+}
+
+/** Fit a rotated editor preview without letting its transformed layout box
+ * escape the stage. CSS transforms do not participate in layout: rotating a
+ * landscape element normally makes it extend into the toolbar. We calculate
+ * the contained post-rotation rectangle, then give the unrotated element the
+ * inverse dimensions so its transformed bounds land exactly in that rect. */
+function fitEditorMedia(stageEl, mediaEl, boxEl, natW, natH, rotate) {
+  const place = () => {
+    const bw = stageEl?.clientWidth, bh = stageEl?.clientHeight;
+    if (!bw || !bh || !natW || !natH) return;
+    const quarter = rotate === 90 || rotate === 270;
+    const vw = quarter ? natH : natW;
+    const vh = quarter ? natW : natH;
+    const scale = Math.min(bw / vw, bh / vh);
+    const dw = vw * scale, dh = vh * scale;
+    Object.assign(mediaEl.style, {
+      width: `${quarter ? dh : dw}px`,
+      height: `${quarter ? dw : dh}px`,
+    });
+    Object.assign(boxEl.style, {
+      left: `${(bw - dw) / 2}px`, top: `${(bh - dh) / 2}px`,
+      width: `${dw}px`, height: `${dh}px`,
+    });
+  };
+  place();
+  mediaEl.addEventListener("load", place);
+  mediaEl.addEventListener("loadedmetadata", place);
+  let ro = null;
+  if (typeof ResizeObserver === "function") {
+    ro = new ResizeObserver(place);
+    ro.observe(stageEl);
+  }
+  return () => {
+    mediaEl.removeEventListener("load", place);
+    mediaEl.removeEventListener("loadedmetadata", place);
+    ro?.disconnect();
+  };
 }
 
 /** Size actually sent after a crop, for badges and tooltips. */
