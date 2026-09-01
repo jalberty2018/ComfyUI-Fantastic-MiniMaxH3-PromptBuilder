@@ -627,8 +627,11 @@ const CSS = `
 .mml-tmcorner.sw{left:-6px;bottom:-6px;cursor:nesw-resize;}
 .mml-tmcorner.se{right:-6px;bottom:-6px;cursor:nwse-resize;}
 .mml-tmcropbar{display:flex;align-items:center;gap:6px;}
+.mml-tmrotate{box-sizing:border-box;flex:0 0 5.4em;width:5.4em;
+  text-align:center;white-space:nowrap;}
 .mml-tmcropinfo{font-size:calc(10px * var(--mml-fs, 1));color:#8a93a3;font-family:ui-monospace,monospace;
-  white-space:nowrap;}
+  white-space:nowrap;box-sizing:border-box;flex:0 0 27ch;width:27ch;
+  overflow:hidden;text-align:left;font-variant-numeric:tabular-nums;}
 .mml-tmcropinfo.changed{color:#4cc3e0;}
 .mml-tmaspect{background:#12151b;color:#c9cfda;border:1px solid #2e3440;
   border-radius:6px;padding:2px 5px;font-size:calc(11px * var(--mml-fs, 1));}
@@ -1243,7 +1246,7 @@ class TrimModal {
     this.cropWrap = el("div", { class: "mml-tmcropwrap" }, this.cropBox);
     requestAnimationFrame(() => this.refitMedia());
     this.cropInfo = el("span", { class: "mml-tmcropinfo" });
-    this.rotBtn = el("button", { class: "mml-btn mml-sm",
+    this.rotBtn = el("button", { class: "mml-btn mml-sm mml-tmrotate",
       title: "Rotate 90\u00b0 clockwise (shift-click for anticlockwise)",
       onclick: (e) => {
         this.rotate = (this.rotate + (e.shiftKey ? 270 : 90)) % 360;
