@@ -6,7 +6,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL as loaderViewURL,
-  safeCanvasFocus, openLoaderModal, isOn } from "./medialoader.js";
+  safeCanvasFocus, openLoaderModal, isOn, fantasticThemeCSS } from "./medialoader.js";
 
 const NODE_NAME = "MiniMaxH3PromptBuilder";
 const LOADER_NAMES = new Set([LOADER_NAME, INPUT_LOADER_NAME]);
@@ -1502,7 +1502,7 @@ const CSS = `
 let cssInjected = false;
 function injectCSS() {
   if (cssInjected) return;
-  document.head.append(el("style", { textContent: CSS }));
+  document.head.append(el("style", { textContent: fantasticThemeCSS(CSS) }));
   cssInjected = true;
 }
 

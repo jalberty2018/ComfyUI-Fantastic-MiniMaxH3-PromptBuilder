@@ -17,6 +17,73 @@ export const MAX = { picture: 9, video: 3, audio: 3, total: 12 };
 export const TRIM_FPS = 24;   // H3's timeline; used for frame-stepping
 export const CLIP = { min: 2, max: 15, totalPerType: 15 };
 
+/** Map the original neutral palette onto ComfyUI's live theme variables.
+ * Accent colours stay untouched. Because the resulting rules keep references
+ * to ComfyUI's variables, switching theme updates open panels immediately. */
+export function fantasticThemeCSS(css) {
+  const palette = `:root{
+    --fh3-bg:var(--comfy-menu-bg,#191c22);
+    --fh3-input:var(--comfy-input-bg,#12151b);
+    --fh3-text:var(--input-text,#d7dbe2);
+    --fh3-border:var(--border-color,#303642);
+    --fh3-panel:color-mix(in srgb,var(--fh3-bg) 96%,var(--fh3-text));
+    --fh3-raised:color-mix(in srgb,var(--fh3-bg) 88%,var(--fh3-text));
+    --fh3-hover:color-mix(in srgb,var(--fh3-bg) 78%,var(--fh3-text));
+    --fh3-muted:color-mix(in srgb,var(--fh3-text) 64%,transparent);
+    --fh3-subtle:color-mix(in srgb,var(--fh3-text) 44%,transparent);
+    --fh3-border-soft:color-mix(in srgb,var(--fh3-border) 72%,transparent);
+    --fh3-border-strong:color-mix(in srgb,var(--fh3-border) 72%,var(--fh3-text));
+  }`;
+  const replacements = new Map([
+    ["#191c22", "var(--fh3-bg)"],
+    ["#12151b", "var(--fh3-input)"],
+    ["#141820", "var(--fh3-input)"],
+    ["#15181e", "var(--fh3-panel)"],
+    ["#171a20", "var(--fh3-panel)"],
+    ["#181b21", "var(--fh3-panel)"],
+    ["#161a21", "var(--fh3-panel)"],
+    ["#151920", "var(--fh3-panel)"],
+    ["#1e222a", "var(--fh3-raised)"],
+    ["#1b1f27", "var(--fh3-raised)"],
+    ["#20242d", "var(--fh3-raised)"],
+    ["#232833", "var(--fh3-raised)"],
+    ["#1d222b", "var(--fh3-raised)"],
+    ["#1d2430", "var(--fh3-raised)"],
+    ["#2b3140", "var(--fh3-raised)"],
+    ["#242a34", "var(--fh3-hover)"],
+    ["#262c38", "var(--fh3-hover)"],
+    ["#2a313d", "var(--fh3-hover)"],
+    ["#2c3340", "var(--fh3-hover)"],
+    ["#333b4d", "var(--fh3-hover)"],
+    ["#2a2f3a", "var(--fh3-border-soft)"],
+    ["#2b303b", "var(--fh3-border-soft)"],
+    ["#2b313d", "var(--fh3-border-soft)"],
+    ["#2e3440", "var(--fh3-border)"],
+    ["#303642", "var(--fh3-border)"],
+    ["#333a45", "var(--fh3-border)"],
+    ["#363d4a", "var(--fh3-border)"],
+    ["#3a4252", "var(--fh3-border-strong)"],
+    ["#4a5568", "var(--fh3-border-strong)"],
+    ["#d7dbe2", "var(--fh3-text)"],
+    ["#dde2ea", "var(--fh3-text)"],
+    ["#c9cfda", "var(--fh3-text)"],
+    ["#c4cad5", "var(--fh3-text)"],
+    ["#a9b2c2", "var(--fh3-muted)"],
+    ["#9aa3b2", "var(--fh3-muted)"],
+    ["#8a93a3", "var(--fh3-muted)"],
+    ["#7d8698", "var(--fh3-muted)"],
+    ["#7a8393", "var(--fh3-muted)"],
+    ["#6b7484", "var(--fh3-muted)"],
+    ["#5c6472", "var(--fh3-subtle)"],
+    ["#4d5563", "var(--fh3-subtle)"],
+    ["#3f4855", "var(--fh3-subtle)"],
+  ]);
+  let themed = css;
+  for (const [colour, variable] of replacements)
+    themed = themed.replaceAll(colour, variable);
+  return palette + themed;
+}
+
 /** Audio clips in play, counting split soundtracks — they spend the same
  *  budget as standalone clips even though they use a different slot group. */
 export function audioCount(all) {
@@ -766,7 +833,7 @@ const CSS = `
 let cssDone = false;
 function injectCSS() {
   if (cssDone) return;
-  document.head.append(el("style", { textContent: CSS }));
+  document.head.append(el("style", { textContent: fantasticThemeCSS(CSS) }));
   cssDone = true;
 }
 

@@ -1,5 +1,6 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { fantasticThemeCSS } from "./medialoader.js";
 
 /* Folder browser for MiniMax H3 Filename Prefix. Navigates the ComfyUI output
    directory server-side; the node itself only ever holds a relative path. */
@@ -40,7 +41,7 @@ function injectCSS() {
   if (cssDone) return;
   cssDone = true;
   const el = document.createElement("style");
-  el.textContent = CSS;
+  el.textContent = fantasticThemeCSS(CSS);
   document.head.append(el);
 }
 
