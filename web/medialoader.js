@@ -10,6 +10,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 export const LOADER_NAME = "MiniMaxH3MediaLoader";
+export const INPUT_LOADER_NAME = "MiniMaxH3InputMediaLoader";
 export const SPLITTER_NAME = "MiniMaxH3ReferenceSplitter";
 export const MAX = { picture: 9, video: 3, audio: 3, total: 12 };
 // H3 policy: 2-15s per reference clip, 15s total per media type.
@@ -734,6 +735,32 @@ const CSS = `
 .mml-presetitem.on{color:#dde2ea;background:#1d2430;}
 .mml-presetempty{padding:4px 8px;font-size:calc(10px * var(--mml-fs, 1));color:#6b7484;
   font-family:system-ui,sans-serif;}
+.mml-inmodal{width:min(980px,94vw);height:min(720px,90vh);background:#191c22;
+  border:1px solid #303642;border-radius:10px;box-shadow:0 24px 64px rgba(0,0,0,.6);
+  display:flex;flex-direction:column;overflow:hidden;font-family:system-ui,sans-serif;}
+.mml-inhead,.mml-infoot{display:flex;align-items:center;gap:7px;padding:9px 11px;
+  background:#1b1f27;border-bottom:1px solid #2a2f3a;}
+.mml-infoot{border-bottom:0;border-top:1px solid #2a2f3a;}
+.mml-intitle{color:#dde2ea;font-size:13px;font-weight:600;margin-right:5px;}
+.mml-inpath{flex:1;min-width:0;color:#8a93a3;font:11px ui-monospace,monospace;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mml-inbody{flex:1;min-height:0;overflow:auto;padding:10px;}
+.mml-ingrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,1fr));gap:8px;}
+.mml-incard{height:122px;position:relative;overflow:hidden;border:1px solid #2e3440;
+  border-radius:7px;background:#11151b;color:#8a93a3;cursor:pointer;user-select:none;}
+.mml-incard:hover{border-color:#59637a}.mml-incard.on{border-color:#4cc3e0;
+  box-shadow:0 0 0 1px #4cc3e0 inset;background:#14242b;}
+.mml-inthumb{width:100%;height:88px;display:flex;align-items:center;justify-content:center;
+  object-fit:contain;background:#0b0e13;color:#8d70c3;font-size:30px;pointer-events:none;}
+.mml-inthumb.folder{color:#d8a84e;font-size:34px;}
+.mml-inname{position:absolute;left:0;right:0;bottom:0;padding:5px 6px;
+  background:#181c24;color:#c9cfda;font-size:10px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;}
+.mml-incheck{position:absolute;right:5px;top:5px;width:18px;height:18px;border-radius:50%;
+  background:#16708d;color:white;display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:bold;}
+.mml-inempty{padding:24px;color:#6b7484;text-align:center;font-size:12px;}
+.mml-instatus{flex:1;color:#8a93a3;font-size:11px;}
 `;
 
 let cssDone = false;
@@ -1845,6 +1872,122 @@ async function uploadFile(file) {
   return data;
 }
 
+async function inputApi(path, body) {
+  const opts = body ? { method: "POST", body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" } } : {};
+  const suffix = body ? "" : `?path=${encodeURIComponent(path || "")}`;
+  const endpoint = body ? "/minimax_h3/input_select" : "/minimax_h3/input_browser";
+  const resp = await api.fetchApi(endpoint + suffix, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
+  return data;
+}
+
+class InputBrowserModal {
+  constructor(panel) {
+    this.panel = panel;
+    this.selected = new Set();
+    this.path = "";
+    this.overlay = el("div", { class: "mml-tmover",
+      onmousedown: (e) => { if (e.target === this.overlay) this.close(); } });
+    this.modal = el("div", { class: "mml-inmodal" });
+    this.overlay.append(this.modal);
+    this.esc = (e) => { if (e.key === "Escape") this.close(); };
+    window.addEventListener("keydown", this.esc);
+    document.body.append(this.overlay);
+    this.load("");
+  }
+
+  close() {
+    window.removeEventListener("keydown", this.esc);
+    this.overlay.remove();
+  }
+
+  async load(path) {
+    this.modal.replaceChildren(el("div", { class: "mml-inempty" },
+      "Reading ComfyUI/input…"));
+    try {
+      const data = await inputApi(path);
+      this.path = data.path || "";
+      this.paint(data);
+    } catch (err) {
+      this.modal.replaceChildren(el("div", { class: "mml-inempty" },
+        `Could not read the input folder: ${err.message}`));
+    }
+  }
+
+  paint(data) {
+    const parent = this.path.includes("/")
+      ? this.path.slice(0, this.path.lastIndexOf("/")) : "";
+    const head = el("div", { class: "mml-inhead" },
+      el("span", { class: "mml-intitle" }, "Select from ComfyUI/input"),
+      el("button", { class: "mml-btn mml-sm", disabled: !this.path,
+        onclick: () => this.load(parent) }, "↑ Up"),
+      el("button", { class: "mml-btn mml-sm", onclick: () => this.load("") }, "Root"),
+      el("span", { class: "mml-inpath", title: this.path || "/" },
+        `ComfyUI/input${this.path ? "/" + this.path : ""}`),
+      el("button", { class: "mml-btn mml-sm", onclick: () => this.close() }, "✕"));
+    const grid = el("div", { class: "mml-ingrid" });
+
+    for (const name of data.dirs || []) {
+      const next = [this.path, name].filter(Boolean).join("/");
+      grid.append(el("div", { class: "mml-incard", title: `Open ${name}`,
+        onclick: () => this.load(next) },
+        el("div", { class: "mml-inthumb folder" }, "📁"),
+        el("div", { class: "mml-inname" }, name)));
+    }
+    for (const item of data.files || []) {
+      const on = this.selected.has(item.file);
+      let thumb;
+      if (item.kind === "picture") {
+        thumb = el("img", { class: "mml-inthumb", src: viewURL(item.file), loading: "lazy" });
+      } else if (item.kind === "video") {
+        thumb = el("video", { class: "mml-inthumb", src: viewURL(item.file),
+          preload: "metadata", muted: true });
+      } else {
+        thumb = el("div", { class: "mml-inthumb" }, "♫");
+      }
+      const card = el("div", { class: "mml-incard" + (on ? " on" : ""),
+        title: item.name, onclick: () => {
+          this.selected.has(item.file) ? this.selected.delete(item.file)
+            : this.selected.add(item.file);
+          this.paint(data);
+        }, ondblclick: async () => {
+          this.selected.add(item.file);
+          await this.addSelected();
+        } }, thumb,
+        on ? el("span", { class: "mml-incheck" }, "✓") : null,
+        el("div", { class: "mml-inname" }, item.name));
+      grid.append(card);
+    }
+    const body = el("div", { class: "mml-inbody" },
+      grid.childNodes.length ? grid : el("div", { class: "mml-inempty" },
+        "No supported image, video, or audio files in this folder."));
+    const foot = el("div", { class: "mml-infoot" },
+      el("span", { class: "mml-instatus" },
+        `${this.selected.size} selected · files are referenced in place, not copied`),
+      el("button", { class: "mml-btn mml-sm", onclick: () => this.close() }, "Cancel"),
+      el("button", { class: "mml-btn primary", disabled: !this.selected.size,
+        onclick: () => this.addSelected() }, "Add selected"));
+    this.modal.replaceChildren(head, body, foot);
+  }
+
+  async addSelected() {
+    if (!this.selected.size) return;
+    const button = this.modal.querySelector(".mml-btn.primary");
+    if (button) { button.disabled = true; button.textContent = "Reading metadata…"; }
+    try {
+      const data = await inputApi("", { files: [...this.selected] });
+      await this.panel.addExisting(data.items || []);
+      this.close();
+    } catch (err) {
+      this.panel.say(`Selection failed: ${err.message}`, true);
+      this.panel.render();
+      if (button) { button.disabled = false; button.textContent = "Add selected"; }
+    }
+  }
+}
+
 /** Give an item a stable id.
  *
  *  Items are re-parsed from JSON whenever a panel syncs, which creates fresh
@@ -1869,6 +2012,7 @@ class LoaderPanel {
     this.node = node;
     this.store = opts.store || null;
     this.storeLabel = opts.storeLabel || "";
+    this.inputOnly = !!opts.inputOnly;
     if (!this.store) (node._mmlPanels = node._mmlPanels || []).push(this);
     this.items = this.read();
     this.busy = 0;
@@ -1899,6 +2043,7 @@ class LoaderPanel {
     this.root.append(this.picker);
 
     this.root.addEventListener("dragover", (e) => {
+      if (this.inputOnly) return;
       if (!e.dataTransfer?.types?.includes("Files")) return;
       e.preventDefault(); e.stopPropagation();
       this.root.classList.add("drop");
@@ -1907,6 +2052,7 @@ class LoaderPanel {
       if (e.target === this.root) this.root.classList.remove("drop");
     });
     this.root.addEventListener("drop", (e) => {
+      if (this.inputOnly) return;
       if (!e.dataTransfer?.files?.length) return;
       e.preventDefault(); e.stopPropagation();
       this.root.classList.remove("drop");
@@ -2466,6 +2612,37 @@ class LoaderPanel {
     this.commit();
   }
 
+  async addExisting(infos) {
+    if (!infos.length) return;
+    const caps = await capabilities();
+    let added = 0;
+    for (const info of infos) {
+      if (!info?.kind || this.count(info.kind) >= MAX[info.kind]) {
+        this.say(`${info?.name || "File"}: no free ${info?.kind || "media"} slot.`, true);
+        continue;
+      }
+      if (info.kind === "audio" && audioCount(this.items) >= MAX.audio) {
+        this.say(`${info.name}: all ${MAX.audio} audio slots are in use.`, true);
+        continue;
+      }
+      if (info.kind === "video" && !caps.video) {
+        this.say(`${info.name}: videos need PyAV on the server.`, true);
+        continue;
+      }
+      const budgetFull = audioCount(this.items) >= MAX.audio;
+      const pairable = info.kind === "video" && info.has_audio;
+      this.items.push({
+        kind: info.kind, file: info.file, name: info.original || info.name,
+        duration: info.duration ?? null, width: info.width ?? null,
+        height: info.height ?? null, has_audio: !!info.has_audio,
+        audio_mode: pairable && !budgetFull ? "paired" : "off",
+      });
+      added += 1;
+    }
+    if (added) this.say(`Selected ${added} existing input file${added === 1 ? "" : "s"}.`);
+    this.commit();
+  }
+
   trimBtn(item) {
     const still = item.kind === "picture";
     if (!still && !item.duration) return null;
@@ -2564,16 +2741,18 @@ class LoaderPanel {
   /** An always-present empty slot: click to browse, drop to fill. */
   emptySlot(kind, index) {
     const slot = el("div", { class: "mml-slot",
-      title: `Empty ${kind} slot ${index} \u2014 click to browse or drop a file`,
-      onclick: () => this.picker.click() },
+      title: `Empty ${kind} slot ${index} \u2014 click to browse${this.inputOnly ? "" : " or drop a file"}`,
+      onclick: () => this.inputOnly ? new InputBrowserModal(this) : this.picker.click() },
       el("span", {}, `${kind} ${index}`));
     slot.addEventListener("dragover", (e) => {
+      if (this.inputOnly) return;
       if (!e.dataTransfer?.types?.includes("Files")) return;
       e.preventDefault(); e.stopPropagation();
       slot.classList.add("hot");
     });
     slot.addEventListener("dragleave", () => slot.classList.remove("hot"));
     slot.addEventListener("drop", (e) => {
+      if (this.inputOnly) return;
       if (!e.dataTransfer?.files?.length) return;
       e.preventDefault(); e.stopPropagation();
       slot.classList.remove("hot");
@@ -2607,10 +2786,12 @@ class LoaderPanel {
     const kids = [this.picker];
 
     kids.push(el("div", { class: "mml-top" },
-      el("button", { class: "mml-btn", onclick: () => this.picker.click() },
-        "Load files\u2026"),
+      el("button", { class: "mml-btn", onclick: () => this.inputOnly
+        ? new InputBrowserModal(this) : this.picker.click() },
+        this.inputOnly ? "Select input files\u2026" : "Load files\u2026"),
       el("span", { style: { fontSize: "10px", color: "#6b7484" } },
-        this.busy ? `uploading ${this.busy}\u2026` : "or drop files on any slot"),
+        this.inputOnly ? "from ComfyUI/input (no upload)"
+          : (this.busy ? `uploading ${this.busy}\u2026` : "or drop files on any slot")),
       el("span", { class: "mml-topspace" }),
       this.scaleControl(),
 
@@ -3063,7 +3244,9 @@ export function addSplitter(node) {
 export function openLoaderModal(node, opts = {}) {
   injectCSS();
   const { onClose, store, storeLabel, draft = false, note = "" } = opts;
-  const panel = new LoaderPanel(node, { store, storeLabel });
+  const panel = new LoaderPanel(node, {
+    store, storeLabel, inputOnly: !!node._mmlInputOnly,
+  });
   const close = () => {
     node._mmlPanels = (node._mmlPanels || []).filter((p) => p !== panel);
     panel.players.forEach((p) => p.stop());
@@ -3095,12 +3278,14 @@ export function openLoaderModal(node, opts = {}) {
 app.registerExtension({
   name: "MiniMaxH3.MediaLoader",
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData.name !== LOADER_NAME) return;
+    if (![LOADER_NAME, INPUT_LOADER_NAME].includes(nodeData.name)) return;
+    const inputOnly = nodeData.name === INPUT_LOADER_NAME;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       try {
         const r = onNodeCreated?.apply(this, arguments);
+        this._mmlInputOnly = inputOnly;
         injectCSS();
         const w = this.widgets?.find((w) => w.name === "media_state");
         if (w) {
@@ -3114,7 +3299,7 @@ app.registerExtension({
         this.addWidget("button", "+ Native-output splitter", null,
           () => addSplitter(this));
 
-        this._mmlPanel = new LoaderPanel(this);
+        this._mmlPanel = new LoaderPanel(this, { inputOnly });
         const widget = this.addDOMWidget("mml_panel", "div", this._mmlPanel.root,
           { serialize: false });
         this._mmlWidget = widget;

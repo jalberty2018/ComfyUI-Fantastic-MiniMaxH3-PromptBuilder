@@ -5,10 +5,11 @@
  */
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { LOADER_NAME, computeTags, viewURL as loaderViewURL,
+import { LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL as loaderViewURL,
   safeCanvasFocus, openLoaderModal, isOn } from "./medialoader.js";
 
 const NODE_NAME = "MiniMaxH3PromptBuilder";
+const LOADER_NAMES = new Set([LOADER_NAME, INPUT_LOADER_NAME]);
 
 /* ------------------------------------------------------------------ */
 /* Reference data straight from the guides                             */
@@ -620,7 +621,7 @@ function loaderItems(node) {
   const idx = (node.inputs || []).findIndex((i) => i.name === "references");
   if (idx < 0 || node.inputs[idx].link == null) return null;
   const loader = originNode(node, idx);
-  if (!loader || loader.type !== LOADER_NAME) return null;
+  if (!loader || !LOADER_NAMES.has(loader.type)) return null;
   try {
     const items = JSON.parse(
       loader.widgets?.find((w) => w.name === "media_state")?.value || "[]");
@@ -2787,7 +2788,7 @@ class Editor {
       return;
     }
     const loader = originNode(this.node, idx);
-    if (!loader || loader.type !== LOADER_NAME) {
+    if (!loader || !LOADER_NAMES.has(loader.type)) {
       toast("The references input isn't wired to a Media Loader");
       return;
     }
@@ -3291,7 +3292,7 @@ class Editor {
         (i) => i.name === "references");
       if (idx < 0 || this.node.inputs[idx].link == null) return;
       const loader = originNode(this.node, idx);
-      if (!loader || loader.type !== LOADER_NAME) return;
+      if (!loader || !LOADER_NAMES.has(loader.type)) return;
       const panel = loader._mmlPanel || loader._mmlPanels?.[0];
       if (panel) {
         panel.items = JSON.parse(JSON.stringify(items));

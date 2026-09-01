@@ -459,6 +459,17 @@ class MiniMaxH3MediaLoader:
         return (bundle,)
 
 
+class MiniMaxH3InputMediaLoader(MiniMaxH3MediaLoader):
+    """Media Loader variant that references files already in ComfyUI/input."""
+
+    DESCRIPTION = (
+        "Select MiniMax H3 reference images, videos, and audio already present "
+        "in ComfyUI's input directory, without uploading or copying them. "
+        "Includes thumbnail previews and the same trim, crop, ordering, preset, "
+        "and audio-routing controls as the Fantastic H3 Media Loader."
+    )
+
+
 def _pad(seq, n):
     return list(seq or []) + [None] * (n - len(seq or []))
 
@@ -637,6 +648,7 @@ class MiniMaxH3FilenamePrefix:
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3PromptBuilder": MiniMaxH3PromptBuilder,
     "MiniMaxH3MediaLoader": MiniMaxH3MediaLoader,
+    "MiniMaxH3InputMediaLoader": MiniMaxH3InputMediaLoader,
     "MiniMaxH3ReferenceSplitter": MiniMaxH3ReferenceSplitter,
     "MiniMaxH3FilenamePrefix": MiniMaxH3FilenamePrefix,
 }
@@ -644,6 +656,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3PromptBuilder": "Fantastic H3 Prompt Builder",
     "MiniMaxH3MediaLoader": "Fantastic H3 Media Loader",
+    "MiniMaxH3InputMediaLoader": "Fantastic H3 Input Media Loader",
     "MiniMaxH3ReferenceSplitter": "Fantastic H3 Reference Splitter",
     "MiniMaxH3FilenamePrefix": "Fantastic H3 Filename Prefix",
 }

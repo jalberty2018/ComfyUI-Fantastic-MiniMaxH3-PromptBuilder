@@ -203,12 +203,13 @@ reference mid-sentence doesn't mean finding the node on the canvas.
 
 ## What you get
 
-Four nodes, all under **conditioning → video_models**:
+Five nodes, all under **conditioning → video_models**:
 
 | Node | What it's for |
 |---|---|
 | **Fantastic H3 Prompt Builder** | The main one. An editor with fillable fields for every prompt mode, checks your work as you type, and outputs the finished prompt. |
 | **Fantastic H3 Media Loader** | Drag-and-drop your reference images, videos, and audio. Shows exactly which tag each one will get. |
+| **Fantastic H3 Input Media Loader** | Select existing media from ComfyUI's `input` folder without uploading or copying it. Includes image/video thumbnails and the same reference controls. |
 | **Fantastic H3 Reference Splitter** | Optional. Fans media out into individual slots when you want it to skip the Prompt Builder. |
 | **Fantastic H3 Filename Prefix** | Optional. Builds a save prefix with the date already filled in, for dated output folders. |
 
@@ -568,6 +569,13 @@ H3 Reference to Video** and the `ref2va` checkpoint.
 5. Connect the Prompt Builder's media outputs — `picture_1`, `video_1`, and so
    on — to the matching slots on **MiniMax H3 Reference to Video**, alongside
    the `prompt` connection you already made.
+
+If the files are already in `/workspace/ComfyUI/input`, add **Fantastic H3
+Input Media Loader** instead. Click **Select input files…**, browse subfolders,
+select one or more image, video, or audio files, then choose **Add selected**.
+The node references those files in place; it does not upload or duplicate them.
+Images and videos are shown as thumbnails where the browser can decode them,
+while audio files use an audio marker and get playback controls after loading.
 
 ### What the media loader shows you
 

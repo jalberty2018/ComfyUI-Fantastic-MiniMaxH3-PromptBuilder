@@ -392,6 +392,121 @@ if PromptServer is not None and web is not None:
             "height": info.get("height"),
         })
 
+    def _input_root():
+        if folder_paths is None:
+            raise RuntimeError("folder_paths unavailable")
+        return os.path.realpath(folder_paths.get_input_directory())
+
+    def _safe_input_dir(rel):
+        """Resolve a browser path, refusing traversal and symlink escapes."""
+        root = _input_root()
+        target = os.path.realpath(os.path.join(root, str(rel or "")))
+        if target != root and not target.startswith(root + os.sep):
+            return root, ""
+        clean = "" if target == root else os.path.relpath(target, root)
+        return target, clean.replace(os.sep, "/")
+
+    @routes.get("/minimax_h3/input_browser")
+    async def input_browser(request):
+        """List supported media inside ComfyUI's input directory.
+
+        Metadata probing is deliberately deferred until selection: opening a
+        folder containing hundreds of videos should remain cheap.
+        """
+        try:
+            target, rel = _safe_input_dir(request.query.get("path", ""))
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+        dirs, files = [], []
+        root = _input_root()
+        try:
+            with os.scandir(target) as it:
+                for entry in it:
+                    if entry.name.startswith("."):
+                        continue
+                    real = os.path.realpath(entry.path)
+                    if real != root and not real.startswith(root + os.sep):
+                        continue
+                    if entry.is_dir(follow_symlinks=True):
+                        dirs.append(entry.name)
+                        continue
+                    if not entry.is_file(follow_symlinks=True):
+                        continue
+                    kind = kind_for(entry.name)
+                    if kind is None:
+                        continue
+                    item_rel = os.path.relpath(real, root).replace(os.sep, "/")
+                    try:
+                        size = entry.stat(follow_symlinks=True).st_size
+                    except OSError:
+                        size = None
+                    files.append({
+                        "name": entry.name,
+                        "file": f"{item_rel} [input]",
+                        "kind": kind,
+                        "size": size,
+                    })
+        except Exception as exc:
+            return web.json_response({"error": f"unreadable: {exc}"}, status=500)
+        dirs.sort(key=str.lower)
+        files.sort(key=lambda item: item["name"].lower())
+        return web.json_response({"path": rel, "dirs": dirs, "files": files})
+
+    @routes.post("/minimax_h3/input_select")
+    @_guard()
+    async def input_select(request):
+        """Validate selected input files and return loader-ready metadata."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "expected JSON body"}, status=400)
+        requested = body.get("files")
+        if not isinstance(requested, list) or not requested:
+            return web.json_response({"error": "no files selected"}, status=400)
+        if len(requested) > 12:
+            return web.json_response({"error": "select at most 12 files"}, status=400)
+
+        root = _input_root()
+        selected = []
+        for value in requested:
+            annotated = str(value or "")
+            try:
+                path = os.path.realpath(media_io.resolve(annotated))
+            except Exception:
+                return web.json_response({"error": "invalid input file"}, status=400)
+            if not path.startswith(root + os.sep) or not os.path.isfile(path):
+                return web.json_response({"error": "file is outside the input folder"},
+                                         status=400)
+            kind = kind_for(path)
+            if kind is None:
+                return web.json_response({"error": "unsupported media file"}, status=400)
+
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            canonical = f"{rel} [input]"
+            info = media_io.probe(canonical)
+            # PyAV normally supplies image dimensions too, but PIL is a small,
+            # reliable fallback for formats/decoders it does not recognise.
+            if kind == "picture" and (not info.get("width") or not info.get("height")):
+                try:
+                    from PIL import Image
+                    with Image.open(path) as image:
+                        info["width"], info["height"] = image.size
+                except Exception:
+                    pass
+            selected.append({
+                "file": canonical,
+                "name": os.path.basename(path),
+                "original": os.path.basename(path),
+                "kind": kind,
+                "size": os.path.getsize(path),
+                "duration": info.get("duration"),
+                "has_audio": bool(info.get("has_audio")),
+                "width": info.get("width"),
+                "height": info.get("height"),
+            })
+        return web.json_response({"items": selected})
+
     @routes.post("/minimax_h3/extract_audio")
     @_guard()
     async def extract_audio_route(request):
