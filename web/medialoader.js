@@ -969,10 +969,13 @@ class TrimModal {
     if (this.isStill) {
       this.media = el("img", { class: "mml-tmvideo", src: url });
       this.media.addEventListener("load", () => {
-        if (!this.item.width) {
+        // Source dimensions are immutable. Reading them again also repairs
+        // workflows saved by older builds that swapped them during rotation.
+        if (this.media.naturalWidth && this.media.naturalHeight) {
           this.item.width = this.media.naturalWidth;
           this.item.height = this.media.naturalHeight;
         }
+        this.syncRotate();
         this.syncCrop();
       });
       return;
@@ -985,7 +988,15 @@ class TrimModal {
       this.media = el("audio", { src: url, preload: "auto" });
     }
     // keep playback inside the selected range
-    this.media.addEventListener("loadedmetadata", () => this.updatePlayhead());
+    this.media.addEventListener("loadedmetadata", () => {
+      if (this.item.kind === "video" && this.media.videoWidth && this.media.videoHeight) {
+        this.item.width = this.media.videoWidth;
+        this.item.height = this.media.videoHeight;
+        this.syncRotate();
+        this.syncCrop();
+      }
+      this.updatePlayhead();
+    });
     this.media.addEventListener("seeked", () => this.updatePlayhead());
     this.media.addEventListener("timeupdate", () => {
       if (this.media.currentTime >= this.end - 0.02) {
@@ -1246,8 +1257,6 @@ class TrimModal {
             ? { x: c.y, y: 1 - c.x - c.w, w: c.h, h: c.w }
             : { x: 1 - c.y - c.h, y: c.x, w: c.h, h: c.w };
         }
-        const t = this.item.width; this.item.width = this.item.height;
-        this.item.height = t;
         this.syncRotate();
         this.syncCrop();
       } }, "\u21bb");
@@ -1356,12 +1365,19 @@ class TrimModal {
     if (!this.cropInfo) return;
     const sw = this.item.width, sh = this.item.height;
     if (!sw || !sh) { this.cropInfo.textContent = ""; return; }
-    const [ow, oh] = outSize({ ...this.item, crop: this.crop, rotate: 0,
+    const [ow, oh] = outSize({ ...this.item, crop: this.crop, rotate: this.rotate,
                                resize: this.resize });
     this.cropInfo.textContent = (ow === sw && oh === sh)
       ? `${sw} \u00d7 ${sh}`
       : `${sw} \u00d7 ${sh} \u2192 ${ow} \u00d7 ${oh}`;
     this.cropInfo.classList.toggle("changed", ow !== sw || oh !== sh);
+  }
+
+  /** Dimensions of the rotated canvas without changing source metadata. */
+  visualSize() {
+    let w = this.item.width, h = this.item.height;
+    if (this.rotate === 90 || this.rotate === 270) [w, h] = [h, w];
+    return [w, h];
   }
 
   /** Say something inside the modal. Panel messages sit behind the overlay,
@@ -1380,13 +1396,16 @@ class TrimModal {
       // A quarter turn means the drawn box swaps its sides; re-measure.
       if (this.cropBox) {
         requestAnimationFrame(() => {
-          const w = this.item.width, h = this.item.height;
+          const [w, h] = this.visualSize();
           if (this.stopFit) this.stopFit();
           this.stopFit = fitToMedia(this.media, this.cropBox, w, h);
         });
       }
     }
-    if (this.rotBtn) this.rotBtn.classList.toggle("on", !!this.rotate);
+    if (this.rotBtn) {
+      this.rotBtn.classList.toggle("on", !!this.rotate);
+      this.rotBtn.textContent = this.rotate ? `↻ ${this.rotate}°` : "↻";
+    }
     this.showSize();
   }
 
@@ -1402,7 +1421,8 @@ class TrimModal {
     if (this.aspect === "free" || !this.crop) return;
     const target = parseFloat(this.aspect);
     if (!target) return;
-    const vw = this.item.width || 16, vh = this.item.height || 9;
+    const visual = this.visualSize();
+    const vw = visual[0] || 16, vh = visual[1] || 9;
     const px = vw / vh;                 // pixels per unit of normalised space
     const c = this.crop;
 
