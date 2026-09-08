@@ -45,6 +45,14 @@ any frame straight out of a video into your picture references.*
 
 ---
 
+## What's new in 1.6.3
+
+**Security hardening:** every state-changing HTTP route now requires a
+server-minted session token, including the fork's input-folder selection
+route. Filename prefixes are validated against ComfyUI's real output path and
+traversal attempts are rejected instead of silently rewritten. The fork's
+input loader, theme support, and rotation fixes remain intact.
+
 ## What's new in 1.6.2
 
 **Security release.** This version exists to address findings from the Comfy

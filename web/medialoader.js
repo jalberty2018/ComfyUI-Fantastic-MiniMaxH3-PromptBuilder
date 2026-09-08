@@ -1333,8 +1333,7 @@ class TrimModal {
     }
     this.modalSay("Writing a resized copy\u2026");
     try {
-      const resp = await api.fetchApi("/minimax_h3/bake", {
-        method: "POST",
+      const resp = await postApi("/minimax_h3/bake", {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           file: this.item.file, resize: this.resize, crop: this.crop,
@@ -1604,8 +1603,7 @@ class TrimModal {
     panel.say(`Extracting ${span.toFixed(1)}s of audio\u2026`);
     panel.render();
     try {
-      const resp = await api.fetchApi("/minimax_h3/extract_audio", {
-        method: "POST",
+      const resp = await postApi("/minimax_h3/extract_audio", {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file: this.item.file,
           start: +this.start.toFixed(3), end: +this.end.toFixed(3) }),
@@ -1987,12 +1985,44 @@ function capabilities() {
   return capsPromise;
 }
 
+const TOKEN_HEADER = "X-MiniMaxH3-Token";
+let tokenPromise = null;
+
+function sessionToken(fresh = false) {
+  if (fresh || !tokenPromise) {
+    tokenPromise = api.fetchApi("/minimax_h3/token")
+      .then((r) => (r.ok
+        ? r.json()
+        : Promise.reject(new Error(`token ${r.status}`))))
+      .then((data) => data.token || Promise.reject(new Error("no token in response")))
+      .catch((err) => {
+        tokenPromise = null;
+        throw err;
+      });
+  }
+  return tokenPromise;
+}
+
+export async function postApi(path, init = {}) {
+  const send = async (token) => api.fetchApi(path, {
+    ...init,
+    method: "POST",
+    headers: { ...(init.headers || {}), [TOKEN_HEADER]: token },
+  });
+  let resp = await send(await sessionToken());
+  if (resp.status === 403) {
+    const data = await resp.clone().json().catch(() => ({}));
+    if (data.token_required) resp = await send(await sessionToken(true));
+  }
+  return resp;
+}
+
 async function presetApi(path, body) {
-  const opts = body
-    ? { method: "POST", body: JSON.stringify(body),
-        headers: { "Content-Type": "application/json" } }
-    : {};
-  const resp = await api.fetchApi("/minimax_h3/presets" + path, opts);
+  const url = "/minimax_h3/presets" + path;
+  const resp = body
+    ? await postApi(url, { body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" } })
+    : await api.fetchApi(url);
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
   return data;
@@ -2001,18 +2031,19 @@ async function presetApi(path, body) {
 async function uploadFile(file) {
   const body = new FormData();
   body.append("file", file, file.name);
-  const resp = await api.fetchApi("/minimax_h3/upload", { method: "POST", body });
+  const resp = await postApi("/minimax_h3/upload", { body });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `upload failed (${resp.status})`);
   return data;
 }
 
 async function inputApi(path, body) {
-  const opts = body ? { method: "POST", body: JSON.stringify(body),
-    headers: { "Content-Type": "application/json" } } : {};
   const suffix = body ? "" : `?path=${encodeURIComponent(path || "")}`;
   const endpoint = body ? "/minimax_h3/input_select" : "/minimax_h3/input_browser";
-  const resp = await api.fetchApi(endpoint + suffix, opts);
+  const resp = body
+    ? await postApi(endpoint, { body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" } })
+    : await api.fetchApi(endpoint + suffix);
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
   return data;

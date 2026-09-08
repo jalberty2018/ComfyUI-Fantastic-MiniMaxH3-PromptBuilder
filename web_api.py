@@ -1,9 +1,11 @@
 """HTTP routes backing the Media Loader's drag-drop and file picker."""
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import time
 
 from . import media_io
@@ -21,6 +23,12 @@ except Exception:  # pragma: no cover
     folder_paths = None
 
 SUBFOLDER = "minimax_h3"
+
+# One unpredictable token per server process. State-changing routes require
+# it in a request header; same-origin frontend code obtains it from the GET
+# route below. Cross-site browser callers cannot obtain it.
+_TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = "X-MiniMaxH3-Token"
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
@@ -311,21 +319,22 @@ if PromptServer is not None and web is not None:
         return bool(netloc) and netloc.lower() != host.lower()
 
     def _guard(json_only=True):
-        """Route decorator: refuse cross-site requests before the handler runs.
+        """Refuse cross-site, token-less, or malformed state changes.
 
-        `json_only` additionally requires Content-Type: application/json.
-        That is itself a CSRF defence, not pedantry: a JSON content type makes
-        the request non-"simple" under CORS, so a cross-origin page cannot
-        send it without a preflight that these routes never approve. Without
-        it, `request.json()` happily parses a text/plain simple request from
-        any page the operator visits — which is exactly what the registry
-        review flagged.
+        The synchronizer token protects requests that arrive without browser
+        origin headers. JSON routes additionally reject simple cross-origin
+        content types before their handlers can mutate state.
         """
         def wrap(handler):
             async def inner(request):
                 if _cross_site(request):
                     return web.json_response(
                         {"error": "cross-site request refused"}, status=403)
+                sent = request.headers.get(TOKEN_HEADER) or ""
+                if not hmac.compare_digest(sent, _TOKEN):
+                    return web.json_response(
+                        {"error": "missing or stale session token",
+                         "token_required": True}, status=403)
                 if json_only:
                     ctype = (request.headers.get("Content-Type") or "") \
                         .split(";")[0].strip().lower()
@@ -338,6 +347,16 @@ if PromptServer is not None and web is not None:
             inner.__doc__ = handler.__doc__
             return inner
         return wrap
+
+    @routes.get("/minimax_h3/token")
+    async def token(request):
+        """Return the process token only to same-origin callers."""
+        if _cross_site(request):
+            return web.json_response(
+                {"error": "cross-site request refused"}, status=403)
+        return web.json_response(
+            {"token": _TOKEN}, headers={"Cache-Control": "no-store"}
+        )
 
     @routes.post("/minimax_h3/upload")
     @_guard(json_only=False)

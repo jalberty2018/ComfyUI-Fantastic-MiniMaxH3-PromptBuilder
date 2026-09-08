@@ -550,9 +550,9 @@ def resolve_date_tokens(text, now=None):
             return match.group(0)
 
     out = re.sub(r"%([%YyGmdjHIMSpaAbBcxXZUWuw])", _code, out)
-    # Keep the result inside the output directory.
-    out = out.replace("\\", "/").replace("..", "").lstrip("/")
-    return re.sub(r"/{2,}", "/", out)
+    # Path safety is not this function's job: every caller feeds the result
+    # into _contain_prefix(), which refuses escapes instead of rewriting them.
+    return out
 
 
 # Labels are format descriptions, not example dates: the chosen label is what
@@ -639,10 +639,34 @@ class MiniMaxH3FilenamePrefix:
         name = resolve_date_tokens((filename or "").strip(), now) or "vid"
         name = name.strip("/")
         prefix = "/".join([p for p in parts if p] + [name])
-        prefix = prefix.replace("\\", "/").replace("..", "")
-        prefix = re.sub(r"/{2,}", "/", prefix).lstrip("/")
+        prefix = _contain_prefix(prefix)
         print(f"[MiniMaxH3 FilenamePrefix] -> {prefix}")
         return (prefix,)
+
+
+def _contain_prefix(prefix):
+    """Normalize a save prefix and refuse one that leaves the output root.
+
+    The node's widgets and queued workflows are attacker-controlled. Core save
+    nodes also validate their destination, but this node must enforce its own
+    contract and fail loudly instead of silently rewriting traversal input.
+    """
+    prefix = prefix.replace("\\", "/")
+    prefix = re.sub(r"^[A-Za-z]:", "", prefix)
+    prefix = re.sub(r"/{2,}", "/", prefix).lstrip("/")
+    if any(segment == ".." for segment in prefix.split("/")):
+        raise ValueError(
+            "filename_prefix must stay inside ComfyUI's output folder — "
+            "remove '..' from the folder, subfolder or filename."
+        )
+    if folder_paths is not None:
+        root = os.path.realpath(folder_paths.get_output_directory())
+        target = os.path.realpath(os.path.join(root, prefix))
+        if os.path.commonpath((root, target)) != root:
+            raise ValueError(
+                "filename_prefix resolves outside ComfyUI's output folder."
+            )
+    return prefix
 
 
 NODE_CLASS_MAPPINGS = {

@@ -6,7 +6,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL as loaderViewURL,
-  safeCanvasFocus, openLoaderModal, isOn, fantasticThemeCSS } from "./medialoader.js";
+  safeCanvasFocus, openLoaderModal, isOn, fantasticThemeCSS, postApi } from "./medialoader.js";
 
 const NODE_NAME = "MiniMaxH3PromptBuilder";
 const LOADER_NAMES = new Set([LOADER_NAME, INPUT_LOADER_NAME]);
@@ -1524,8 +1524,7 @@ function toast(msg, ms = 1800) {
  * preset store except through the user's own explicit save. */
 
 async function draftApi(path, body) {
-  const resp = await api.fetchApi("/minimax_h3/drafts" + path, {
-    method: "POST",
+  const resp = await postApi("/minimax_h3/drafts" + path, {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -1607,8 +1606,7 @@ function draftIdFor(node) {
 }
 
 async function presetApi(path, body) {
-  const resp = await api.fetchApi("/minimax_h3/presets" + path, {
-    method: "POST",
+  const resp = await postApi("/minimax_h3/presets" + path, {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -1618,11 +1616,11 @@ async function presetApi(path, body) {
 }
 
 async function libApi(path, body) {
-  const opts = body
-    ? { method: "POST", body: JSON.stringify(body),
-        headers: { "Content-Type": "application/json" } }
-    : {};
-  const resp = await api.fetchApi("/minimax_h3/prompts" + path, opts);
+  const url = "/minimax_h3/prompts" + path;
+  const resp = body
+    ? await postApi(url, { body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" } })
+    : await api.fetchApi(url);
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     const err = new Error(data.error || `request failed (${resp.status})`);
@@ -4256,8 +4254,7 @@ class Editor {
   async savePhrase(entry) {
     if (!entry.name) { toast("Give the phrase a name", 3500); return; }
     try {
-      const resp = await api.fetchApi("/minimax_h3/phrases/save", {
-        method: "POST",
+      const resp = await postApi("/minimax_h3/phrases/save", {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(entry),
       });
@@ -4285,8 +4282,7 @@ class Editor {
     this.drawPhraseBar();
     if (!p) return;
     try {
-      const resp = await api.fetchApi("/minimax_h3/phrases/delete", {
-        method: "POST",
+      const resp = await postApi("/minimax_h3/phrases/delete", {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: p.id }),
       });
