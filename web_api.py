@@ -24,9 +24,13 @@ except Exception:  # pragma: no cover
 
 SUBFOLDER = "minimax_h3"
 
-# One unpredictable token per server process. State-changing routes require
-# it in a request header; same-origin frontend code obtains it from the GET
-# route below. Cross-site browser callers cannot obtain it.
+# One random token per server process. Every state-changing route demands it
+# in a request header; the frontend fetches it from a same-origin GET. A page
+# on another origin can send a POST but cannot read that GET's response, so it
+# can never learn the header value. That is the synchronizer-token pattern —
+# the mitigation the registry's review names outright ("no server-minted
+# CSRF token") — and unlike the Sec-Fetch-Site check it does not fall open
+# for requests that arrive without browser headers.
 _TOKEN = secrets.token_urlsafe(32)
 TOKEN_HEADER = "X-MiniMaxH3-Token"
 
@@ -145,6 +149,52 @@ def _write_phrases(items):
 def _slug(text):
     out = re.sub(r"[^A-Za-z0-9 ._-]+", "_", str(text or "")).strip(" ._-")
     return out[:80] or None
+
+
+def _host_port(value):
+    """('host', port or None) from a Host header or an Origin's authority.
+
+    Parsed by hand rather than with a URL library: a browser only ever sends
+    `host[:port]` or `[ipv6]:port`, and anything else is refused rather
+    than guessed at. Userinfo never appears in either header."""
+    v = (value or "").strip().lower()
+    if not v or "@" in v:
+        return "", None
+    if v.startswith("["):                       # [ipv6] or [ipv6]:port
+        end = v.find("]")
+        if end < 0:
+            return "", None
+        host, rest = v[1:end], v[end + 1:]
+    else:
+        host, sep, port = v.partition(":")
+        rest = (":" + port) if sep else ""
+    if not host:
+        return "", None
+    if not rest:
+        return host, None
+    if not rest.startswith(":") or not rest[1:].isdigit():
+        return "", None
+    return host, int(rest[1:])
+
+
+def _same_authority(origin, host_header):
+    """Does an Origin header name the host this request arrived at?
+
+    `Origin: null` (an opaque or sandboxed origin) never matches. A default
+    port left implicit on one side still matches the same port stated on
+    the other, so `http://host` and `Host: host:80` agree."""
+    origin = (origin or "").strip()
+    if not origin or origin.lower() == "null":
+        return False
+    scheme, sep, rest = origin.partition("://")
+    if not sep:
+        return False
+    o_host, o_port = _host_port(rest.split("/", 1)[0])
+    h_host, h_port = _host_port(host_header)
+    if not o_host or not h_host or o_host != h_host:
+        return False
+    default = 443 if scheme.strip().lower() == "https" else 80
+    return (o_port or default) == (h_port or default)
 
 
 def _contained(path, directory):
@@ -308,22 +358,20 @@ if PromptServer is not None and web is not None:
         origin = (request.headers.get("Origin") or "").strip()
         if not origin:
             return False
-        if origin.lower() == "null":            # sandboxed / opaque origin
-            return True
-        try:
-            from urllib.parse import urlsplit
-            netloc = urlsplit(origin).netloc
-        except Exception:
-            return True
-        host = (request.headers.get("Host") or "").strip()
-        return bool(netloc) and netloc.lower() != host.lower()
+        return not _same_authority(origin, request.headers.get("Host"))
 
     def _guard(json_only=True):
-        """Refuse cross-site, token-less, or malformed state changes.
+        """Route decorator: refuse cross-site or token-less requests before
+        the handler runs.
 
-        The synchronizer token protects requests that arrive without browser
-        origin headers. JSON routes additionally reject simple cross-origin
-        content types before their handlers can mutate state.
+        Three checks, cheapest first. The Sec-Fetch-Site/Origin test rejects
+        anything a browser marks as another site. The token check rejects
+        anything that did not first read /minimax_h3/token from this origin
+        — which is every cross-site page, and every request that simply
+        omits browser headers. `json_only` additionally requires
+        Content-Type: application/json, which makes the request non-"simple"
+        under CORS so a cross-origin page cannot send it without a preflight
+        these routes never approve.
         """
         def wrap(handler):
             async def inner(request):
@@ -350,13 +398,17 @@ if PromptServer is not None and web is not None:
 
     @routes.get("/minimax_h3/token")
     async def token(request):
-        """Return the process token only to same-origin callers."""
+        """Hand the session token to same-origin callers only.
+
+        The cross-site check matters here even though this is a GET: with
+        `--enable-cors-header` a permissive CORS policy would otherwise let
+        another origin read this response and defeat the token.
+        """
         if _cross_site(request):
             return web.json_response(
                 {"error": "cross-site request refused"}, status=403)
-        return web.json_response(
-            {"token": _TOKEN}, headers={"Cache-Control": "no-store"}
-        )
+        return web.json_response({"token": _TOKEN},
+                                 headers={"Cache-Control": "no-store"})
 
     @routes.post("/minimax_h3/upload")
     @_guard(json_only=False)
@@ -761,6 +813,113 @@ if PromptServer is not None and web is not None:
         caps["video"] = media_io.can_decode_video()
         caps["version"] = _pack_version()
         return web.json_response(caps)
+
+    # -- RefMod library -----------------------------------------------------
+    # Read-only, so no session token: the same posture as /browse. Both
+    # routes resolve names through refmods.resolve_file, which refuses
+    # anything that does not land inside a registered RefMod root.
+
+    @routes.get("/minimax_h3/refmods")
+    async def refmod_library(request):
+        """Every RefMod on disk, paired and costed, for the stack's browser."""
+        try:
+            from . import refmods
+            data = dict(refmods.scan_library())
+            data["pack_installed"] = refmods.origin_module() is not None
+            return web.json_response(data, headers={"Cache-Control": "no-store"})
+        except Exception as exc:
+            return web.json_response({"error": f"scan failed: {exc}"}, status=500)
+
+    @routes.get("/minimax_h3/refmods/preview")
+    async def refmod_preview(request):
+        """The image saved beside a RefMod, for its thumbnail."""
+        from . import refmods
+        path = refmods.resolve_file(request.query.get("name", ""),
+                                    refmods.PREVIEW_EXT)
+        if not path:
+            return web.json_response({"error": "no preview"}, status=404)
+        return web.FileResponse(path, headers={"Cache-Control": "max-age=60"})
+
+    @routes.post("/minimax_h3/refmods/rename")
+    @_guard()
+    async def refmod_rename(request):
+        """Move an item (its files, pair suffixes kept) to a new name/folder."""
+        from . import refmods
+        try:
+            body = await request.json()
+            moved = refmods.rename_item(body.get("files"), body.get("preview"),
+                                        body.get("new_name", ""))
+            return web.json_response({"moved": moved})
+        except (ValueError, FileNotFoundError, FileExistsError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"rename failed: {exc}"}, status=500)
+
+    @routes.post("/minimax_h3/refmods/meta")
+    @_guard()
+    async def refmod_meta(request):
+        """Rewrite description / concept_type in each file's header."""
+        from . import refmods
+        try:
+            body = await request.json()
+            fields = {}
+            if "description" in body:
+                fields["description"] = str(body.get("description") or "")[:2000]
+            if "concept_type" in body:
+                fields["concept_type"] = str(body.get("concept_type") or "generic")[:40]
+            refmods.rewrite_meta(body.get("files"), **fields)
+            return web.json_response({"ok": True})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"update failed: {exc}"}, status=500)
+
+    @routes.post("/minimax_h3/refmods/delete")
+    @_guard()
+    async def refmod_delete(request):
+        from . import refmods
+        try:
+            body = await request.json()
+            removed = refmods.delete_item(body.get("files"), body.get("preview"))
+            return web.json_response({"removed": removed})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"delete failed: {exc}"}, status=500)
+
+    @routes.post("/minimax_h3/refmods/set_preview")
+    @_guard(json_only=False)
+    async def refmod_set_preview(request):
+        """Multipart: `stem` (relative name) + `file` (an image) -> <stem>.png."""
+        from . import refmods
+        try:
+            reader = await request.multipart()
+            stem, data = "", None
+            field = await reader.next()
+            while field is not None:
+                if field.name == "stem":
+                    stem = (await field.text()).strip()
+                elif field.name == "file":
+                    chunks = []
+                    total = 0
+                    while True:
+                        chunk = await field.read_chunk()
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > 32 << 20:
+                            return web.json_response({"error": "image too large"}, status=413)
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                field = await reader.next()
+            if not data:
+                return web.json_response({"error": "no image"}, status=400)
+            saved = refmods.set_preview(stem, data)
+            return web.json_response({"preview": saved})
+        except (ValueError, FileNotFoundError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"preview failed: {exc}"}, status=500)
 
     @routes.get("/minimax_h3/presets")
     async def list_presets(request):

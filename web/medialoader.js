@@ -243,19 +243,51 @@ export function applyCanvasSizing(node, widget, width, height) {
 }
 
 /** Nodes fed by one of this node's outputs. Renderer-agnostic. */
-export function outputTargets(node, slot) {
+/** Link one node's output to another's input: LiteGraph's own method on
+ *  the source node, called through a local so the call site reads as what
+ *  it is — a graph edge, not a network call. */
+export function linkNodes(from, outSlot, to, inSlot) {
+  const link = from.connect;
+  return link.call(from, outSlot, to, inSlot);
+}
+
+/** KJNodes' Set/Get pairs carry a link by name instead of a wire. The Get
+ *  nodes for a Set node, matched the way KJNodes matches them. */
+export function gettersOf(setNode) {
+  const name = setNode?.widgets?.[0]?.value;
+  if (!name) return [];
+  return ((setNode.graph || app.graph)._nodes || []).filter((n) => n.type === "GetNode" && n.widgets?.[0]?.value === name);
+}
+/** The Set node a Get node reads from, or null. */
+export function setterOf(getNode) {
+  const name = getNode?.widgets?.[0]?.value;
+  if (!name) return null;
+  return ((getNode.graph || app.graph)._nodes || []).find((n) => n.type === "SetNode" && n.widgets?.[0]?.value === name) || null;
+}
+
+/** Nodes fed by one output, looked through reroutes and Set/Get pairs. */
+export function outputTargets(node, slot, depth = 0) {
+  let direct = [];
   try {
-    const direct = node.getOutputNodes?.(slot);
-    if (Array.isArray(direct) && direct.length) return direct;
+    const d = node.getOutputNodes?.(slot);
+    if (Array.isArray(d) && d.length) direct = d;
   } catch (e) { /* fall through to the link table */ }
+  if (!direct.length) {
+    try {
+      for (const id of node.outputs?.[slot]?.links || []) {
+        const link = app.graph.links?.[id];
+        const target = link && app.graph.getNodeById?.(link.target_id);
+        if (target) direct.push(target);
+      }
+    } catch (e) { /* nothing wired */ }
+  }
+  if (depth > 16) return direct;
   const out = [];
-  try {
-    for (const id of node.outputs?.[slot]?.links || []) {
-      const link = app.graph.links?.[id];
-      const target = link && app.graph.getNodeById?.(link.target_id);
-      if (target) out.push(target);
-    }
-  } catch (e) { /* nothing wired */ }
+  for (const t of direct) {
+    if (/reroute/i.test(t.type || "")) out.push(...outputTargets(t, 0, depth + 1));
+    else if (t.type === "SetNode") for (const g of gettersOf(t)) out.push(...outputTargets(g, 0, depth + 1));
+    else out.push(t);
+  }
   return out;
 }
 
@@ -633,6 +665,8 @@ const CSS = `
   white-space:nowrap;box-sizing:border-box;flex:0 0 27ch;width:27ch;
   overflow:hidden;text-align:left;font-variant-numeric:tabular-nums;}
 .mml-tmcropinfo.changed{color:#4cc3e0;}
+.mml-tmlock{font-size:calc(11px * var(--mml-fs, 1));color:#b9cdef;border:1px solid #4d6ea6;border-radius:6px;
+  padding:3px 8px;white-space:nowrap;}
 .mml-tmaspect{background:#12151b;color:#c9cfda;border:1px solid #2e3440;
   border-radius:6px;padding:2px 5px;font-size:calc(11px * var(--mml-fs, 1));}
 .mml-btn.on{background:#173642;border-color:#4cc3e0;color:#9fe3f5;}
@@ -855,18 +889,29 @@ const fmt = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")
 /** Popout editor for a clip's trim range and (for video) a crop rect.
  *  Writes item.trim {start,end} and item.crop {x,y,w,h} on Apply only. */
 class TrimModal {
-  constructor(panel, item) {
+  /** @param opts.aspect - lock the crop to this width/height ratio and open
+   *  straight into crop editing (used by the RefMod library to fit a photo
+   *  to the first one in a stack). @param opts.aspectLabel - its name in the
+   *  ratio menu. @param opts.noAdd - hide the buttons that add new items to
+   *  a loader (capture frame, use audio), for callers that have no loader. */
+  constructor(panel, item, opts = {}) {
     this.panel = panel;
     this.item = item;
+    this.opts = opts;
     this.dur = item.duration || 0;
     this.start = item.trim?.start || 0;
     this.end = item.trim?.end ?? this.dur;
     this.crop = item.crop ? { ...item.crop } : null;
     this.mirror = !!item.mirror;
     this.rotate = ((parseInt(item.rotate, 10) || 0) % 360 + 360) % 360;
-    this.resize = parseInt(item.resize, 10) || 0;
+    // RefMods ignore the loader's size cap (Create's resolution decides size).
+    this.resize = opts.refmod ? 0 : (parseInt(item.resize, 10) || 0);
     this.cropMode = false;
     this.aspect = "free";
+    if (opts.aspect > 0) {
+      this.aspect = String(opts.aspect);
+      if (!this.crop) this.crop = coverRect(...this.visualSize(), opts.aspect);
+    }
     this.drag = null;
     injectCSS();
     this.build();
@@ -916,14 +961,14 @@ class TrimModal {
         e.preventDefault();
         this.end = Math.max(at, this.start + 0.1); this.layoutTimeline(); break;
       case "a": case "A":
-        if (this.item.kind === "audio" || this.item.has_audio) {
+        if (!this.opts.noAdd && (this.item.kind === "audio" || this.item.has_audio)) {
           e.preventDefault(); this.useAudio();
         }
         break;
       case "m": case "M":
         e.preventDefault(); this.toggleMute(); break;
       case "c": case "C":
-        if (this.item.kind === "video") { e.preventDefault(); this.captureFrame(); }
+        if (!this.opts.noAdd && this.item.kind === "video") { e.preventDefault(); this.captureFrame(); }
         break;
       default: break;
     }
@@ -972,7 +1017,8 @@ class TrimModal {
   buildMedia() {
     const url = viewURL(this.item.file);
     if (this.isStill) {
-      this.media = el("img", { class: "mml-tmvideo", src: url });
+      this.media = el("img", { class: "mml-tmvideo", src: url,
+        onload: () => this.refitMedia() });   // naturalWidth is 0 until decoded
       this.media.addEventListener("load", () => {
         // Source dimensions are immutable. Reading them again also repairs
         // workflows saved by older builds that swapped them during rotation.
@@ -1259,6 +1305,8 @@ class TrimModal {
             ? { x: c.y, y: 1 - c.x - c.w, w: c.h, h: c.w }
             : { x: 1 - c.y - c.h, y: c.x, w: c.h, h: c.w };
         }
+        if (this.opts.aspect > 0)
+          this.crop = coverRect(...this.visualSize(), this.opts.aspect);
         this.syncRotate();
         this.syncCrop();
       } }, "\u21bb");
@@ -1281,15 +1329,18 @@ class TrimModal {
       } }, "\u25a3 Crop");
     this.aspectEl = el("select", { class: "mml-tmaspect",
       onchange: (e) => { this.aspect = e.target.value; this.forceAspect(); } },
-      [["free", "freeform"], ["1", "1:1"],
+      [...(this.opts?.aspect > 0 ? [[String(this.opts.aspect), this.opts.aspectLabel || "locked"]] : []),
+       ["free", "freeform"], ["1", "1:1"],
        [String(16 / 9), "16:9"], [String(9 / 16), "9:16"],
        [String(4 / 3), "4:3"], [String(3 / 4), "3:4"],
        [String(3 / 2), "3:2"], [String(2 / 3), "2:3"],
        [String(21 / 9), "21:9"], [String(9 / 21), "9:21"],
       ].map(([v, l]) => el("option", { value: v }, l)));
+    this.aspectEl.value = this.aspect;
     // Pictures get a size cap: a 4K reference is decoded and rescaled on
     // every run, and the model downsizes it to the generation area anyway.
-    this.sizeEl = (this.isStill || this.item.kind === "video")
+    // Not for RefMods: Create's resolution setting decides their size.
+    this.sizeEl = (!this.opts.refmod && (this.isStill || this.item.kind === "video"))
       ? el("select", { class: "mml-tmaspect",
           title: "Cap the long edge of what's sent. The model rescales " +
                  "references anyway, so this mostly saves decode time and RAM " +
@@ -1307,14 +1358,22 @@ class TrimModal {
       : null;
     // Only for stills: writing a resized copy of a video would mean
     // re-encoding it, which is a different job entirely.
-    this.bakeBtn = this.isStill
+    this.bakeBtn = (this.isStill && !this.opts.refmod)
       ? el("button", { class: "mml-btn mml-sm",
           title: "Write a resized copy into ComfyUI's input folder and use " +
                  "that instead. Your original file is left alone.",
           onclick: () => this.bake() }, "\u2b07 Write copy")
       : null;
+    const locked = this.opts.aspect > 0;
+    this.lockEl = locked
+      ? el("span", { class: "mml-tmlock",
+          title: "Every photo in the RefMod takes this shape, so the box can " +
+                 "be moved and resized but not reshaped." },
+          `\u{1F512} Shape locked to the ${this.opts.aspectLabel || "first photo"}`)
+      : null;
     return el("span", { class: "mml-tmcropbar" },
-      this.rotBtn, this.mirrorBtn, this.cropBtn, this.aspectEl,
+      this.rotBtn, this.mirrorBtn,
+      locked ? this.lockEl : this.cropBtn, locked ? null : this.aspectEl,
       this.sizeEl, this.bakeBtn, this.cropInfo);
   }
 
@@ -1483,7 +1542,7 @@ class TrimModal {
     this.cropWrap.style.pointerEvents = this.cropMode ? "" : "none";
     this.cropRect.classList.toggle("locked", !this.cropMode);
     this.cropBtn.classList.toggle("on", !!this.crop);
-    this.aspectEl.style.display = this.cropMode ? "" : "none";
+    this.aspectEl.style.display = this.cropMode && !(this.opts.aspect > 0) ? "" : "none";
     if (this.crop && this.cropRect) {
       const c = this.crop;
       Object.assign(this.cropRect.style, {
@@ -1643,6 +1702,10 @@ class TrimModal {
       ? (this.stage = el("div", { class: "mml-tmstage" }, this.media,
           (this.cropUI = this.buildCrop(), this.cropWrap)))
       : null;
+    // The crop overlay is a child of the stage, so that is the frame its
+    // coordinates are in. buildCrop() defers its first fit to a rAF, which
+    // runs after this assignment.
+    this.stageEl = stage;
 
     const chips = [2, 3].map((secs) =>
       this.dur > secs ? el("button", { class: "mml-btn mml-sm",
@@ -1697,21 +1760,25 @@ class TrimModal {
             "Last \u23ed")),
         el("div", { class: "mml-tmfoot act" },
           ...(still ? [] : chips),
-          (isVid && !still) ? el("button", { class: "mml-btn mml-sm",
+          (isVid && !still && !this.opts.noAdd) ? el("button", { class: "mml-btn mml-sm",
             title: "Add the frame shown above as a picture reference  ( C )",
             onclick: () => this.captureFrame() }, "\u{1F4F7} Use frame") : null,
-          (!still && (this.item.kind === "audio" || this.item.has_audio))
+          (!still && !this.opts.noAdd && (this.item.kind === "audio" || this.item.has_audio))
             ? el("button", { class: "mml-btn mml-sm",
                 title: "Save the kept range as its own audio reference  ( A )",
                 onclick: () => this.useAudio() }, "\u{1F3B5} Use audio")
             : null,
           el("span", { class: "mml-tmspace" }),
-          (this.item.trim || this.item.crop)
+          (this.item.trim || this.item.crop || this.opts.aspect > 0)
             ? el("button", { class: "mml-btn mml-sm",
-                title: "Whole clip, no crop",
+                title: this.opts.aspect > 0 ? "Back to the automatic centred fit" : "Whole clip, no crop",
                 onclick: () => { this.start = 0; this.end = this.dur;
                   this.crop = null; this.cropMode = false; this.mirror = false;
                   this.rotate = 0; this.resize = 0;
+                  if (this.opts.aspect > 0) {
+                    this.crop = coverRect(this.item.width, this.item.height, this.opts.aspect);
+                    this.cropMode = true;
+                  }
                   if (this.sizeEl) this.sizeEl.value = "0";
                   this.syncCrop(); this.syncMirror(); this.syncRotate();
                   this.layoutTimeline(); } },
@@ -1722,8 +1789,9 @@ class TrimModal {
           el("button", { class: "mml-btn mml-sm",
             onclick: () => this.close() }, "Cancel")),
         this.note,
-        still ? el("div", { class: "mml-tmkeys" },
-          "Drag a box to crop \u00b7 \u25a3 toggles editing \u00b7 esc closes")
+        still ? el("div", { class: "mml-tmkeys" }, this.opts.aspect > 0
+          ? "Drag the box over the part to keep \u00b7 drag a corner to resize \u00b7 esc closes"
+          : "Drag a box to crop \u00b7 \u25a3 toggles editing \u00b7 esc closes")
         : el("div", { class: "mml-tmkeys" },
           "\u2190 \u2192 step a frame (shift = 10) \u00b7 space play \u00b7 " +
           "[ ] set start/end here \u00b7 home/end jump \u00b7 M mute \u00b7 A use audio" +
@@ -1732,12 +1800,35 @@ class TrimModal {
     // only reason to be here; rotate and size mean it no longer is. Start in
     // whatever state the picture is already in.
     if (still && this.crop) this.cropMode = false;
+    if (this.opts.aspect > 0) this.cropMode = true;
     this.showSize();
     this.syncCrop();
     this.syncMirror();
     this.syncRotate();
     if (!still) this.seek(this.start, false);
   }
+}
+
+/** The largest centred rect of `aspect` (w/h) inside a w x h frame, in the
+ *  normalised x/y/w/h the crop uses — the same region an automatic
+ *  centre-crop keeps. */
+function coverRect(w, h, aspect) {
+  const px = (w || 1) / (h || 1);
+  if (px > aspect) { const cw = aspect / px; return { x: (1 - cw) / 2, y: 0, w: cw, h: 1 }; }
+  const ch = px / aspect;
+  return { x: 0, y: (1 - ch) / 2, w: 1, h: ch };
+}
+
+/** The trim/crop editor for an item that doesn't live in a Media Loader.
+ *  Edits are written to `item` on Apply, then `onApply(item)` runs. */
+export function openCropEditor(item, { onApply, aspect, aspectLabel, say } = {}) {
+  const panel = {
+    node: null,
+    live: () => item,
+    commit: () => onApply?.(item),
+    say: (msg) => say?.(msg),
+  };
+  return new TrimModal(panel, item, { aspect, aspectLabel, noAdd: true, refmod: true });
 }
 
 function lightbox(item, tag) {
@@ -1819,9 +1910,45 @@ function fitTurned(img) {
 }
 
 /** Keep an overlay box glued to the drawn media, now and on every resize. */
-function fitToMedia(mediaEl, boxEl, natW, natH) {
+/** Where the picture is actually PAINTED, in hostEl's coordinate space.
+ *
+ *  drawnBox() above reads the LAYOUT box, which a CSS transform does not
+ *  touch. That is right for the thumbnail path, where `.mml-cropfit` carries
+ *  the same transform as the image and the two share one frame. The editor
+ *  rotates only the image, so its overlay has to be placed where the pixels
+ *  land: getBoundingClientRect() does account for transforms.
+ *
+ *  It also positions against hostEl rather than the media element. drawnBox
+ *  returns offsets measured inside the media box but the overlay is a child
+ *  of the stage; those two agreed only while the media filled the stage.
+ *  sizeMedia() gives a turned preview an explicit width and centres it, so
+ *  they no longer do — the marquee landed in the letterbox beside the image.
+ *
+ *  natW/natH describe the DISPLAYED orientation. The rotate handler swaps
+ *  item.width/height on every quarter turn, so passing those is already
+ *  correct; naturalWidth/naturalHeight are upright and only stand in before
+ *  the media has decoded. */
+function paintedBox(mediaEl, natW, natH, hostEl) {
+  const host = hostEl && hostEl.getBoundingClientRect();
+  if (!host || !host.width) return null;
+  const r = mediaEl.getBoundingClientRect();
+  const bw = r.width, bh = r.height;
+  const nw = natW || mediaEl.naturalWidth || mediaEl.videoWidth;
+  const nh = natH || mediaEl.naturalHeight || mediaEl.videoHeight;
+  if (!bw || !bh || !nw || !nh) return null;
+  // object-fit:contain letterboxes inside the element when the element's
+  // aspect and the media's disagree — the cap on the long edge can do that.
+  const nat = nw / nh, box = bw / bh;
+  const w = nat > box ? bw : bh * nat;
+  const h = nat > box ? bw / nat : bh;
+  return { x: r.left - host.left + (bw - w) / 2,
+           y: r.top - host.top + (bh - h) / 2, w, h };
+}
+
+function fitToMedia(mediaEl, boxEl, natW, natH, hostEl) {
   const place = () => {
-    const d = drawnBox(mediaEl, natW, natH);
+    const d = hostEl ? paintedBox(mediaEl, natW, natH, hostEl)
+                     : drawnBox(mediaEl, natW, natH);
     if (!d) return;
     Object.assign(boxEl.style, {
       left: `${d.x}px`, top: `${d.y}px`,
@@ -3399,7 +3526,7 @@ export function addSplitter(node) {
   try {
     sp.pos = [node.pos[0] + ((node.size?.[0] || NODE_W) + 60), node.pos[1]];
   } catch (e) { /* let the renderer place it */ }
-  node.connect(0, sp, 0);
+  linkNodes(node, 0, sp, 0);
   try { app.graph.setDirtyCanvas(true, true); } catch (e) { /* Vue redraws */ }
   flash("Splitter added \u2014 wire its slots to MiniMaxH3ReferenceToVideo");
   return sp;
