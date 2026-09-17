@@ -6,7 +6,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL as loaderViewURL,
-  safeCanvasFocus, openLoaderModal, isOn, fantasticThemeCSS, postApi, outputTargets, setterOf, linkNodes } from "./medialoader.js";
+  safeCanvasFocus, openLoaderModal, isOn, fantasticThemeCSS, postApi, outputTargets, setterOf, linkNodes, keepNameChars } from "./medialoader.js";
 import { STACK_NAME, ENCODE_NAMES, readStack, deriveEntries, labelGroups,
   rangeText as refmodRange, previewURL as refmodPreviewURL, KIND as REFMOD_KIND,
   openStackModal } from "./refmodstack.js";
@@ -82,13 +82,208 @@ const TAG_RE = /<(?:Picture|Video|Audio|Subject) \d+>/g;
 /* One pass over a field paints three things: dialogue blocks, reference tags
    and speaker IDs. Dialogue is matched first so tags inside a spoken line
    aren't chipped out of it. */
-const PAINT_RE = new RegExp([
-  "<d>[\\s\\S]*?<\\/d>",                      // a spoken line
-  // a cut marker, with its timestamp when one follows
-  "\\[Shot \\d+\\](?:\\s+at\\s+\\d{1,2}:\\d{2}(?:\\.\\d{1,3})?)?",
-  "<(?:Picture|Video|Audio|Subject) \\d+>",     // a reference tag
-  "\\(S\\d+(?:\\s*,\\s*S\\d+)*\\)",           // (S1) or (S1,S2)
-].join("|"), "g");
+/* The character that turns a subject's name into shorthand (!Bob). It's a
+   per-user editor preference, picked from symbols that mean nothing else in
+   an H3 prompt, so the patterns below are rebuilt when it changes. */
+const NAME_PREFIXES = ["!", "@", "#", "$", "%", "&", "*", "~", "+", "=", "^"];
+let NAME_PREFIX = "!";
+const reEsc = (c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+let PAINT_RE, NAME_TOKEN_RE, NAME_SPLIT_RE;
+function setNamePrefix(ch) {
+  NAME_PREFIX = NAME_PREFIXES.includes(ch) ? ch : "!";
+  const p = reEsc(NAME_PREFIX);
+  PAINT_RE = new RegExp([
+    "<d>[\\s\\S]*?<\\/d>",                      // a spoken line
+    // a cut marker, with its timestamp when one follows
+    "\\[Shot \\d+\\](?:\\s+at\\s+\\d{1,2}:\\d{2}(?:\\.\\d{1,3})?)?",
+    "<(?:Picture|Video|Audio|Subject) \\d+>",     // a reference tag
+    "\\(S\\d+(?:\\s*,\\s*S\\d+)*\\)",           // (S1) or (S1,S2)
+    `${p}[A-Za-z][\\w-]*`,                        // !Name shorthand for a named subject
+  ].join("|"), "g");
+  NAME_TOKEN_RE = new RegExp(`${p}([A-Za-z][\\w-]*)`, "g");
+  NAME_SPLIT_RE = new RegExp(`(${p}[A-Za-z][\\w-]*)`);
+}
+setNamePrefix("!");
+
+/** Named subjects from the switched-on definition lines that carry a name,
+ *  keyed by the lower-cased name so !bob, !Bob and !BOB all find "Bob":
+ *  { bob: { tag: "<Subject 1>", name: "Bob" } }. */
+function subjectNames(state) {
+  const out = {};
+  for (const d of state?.ref?.subjectDefs || []) {
+    if (d.off) continue;
+    const name = (d.name || "").trim();
+    const m = (d.text || "").trim().match(/^<Subject (\d+)>/);
+    const key = name.toLowerCase();
+    if (name && m && /^[A-Za-z][\w-]*$/.test(name) && !(key in out)) out[key] = { tag: `<Subject ${m[1]}>`, name };
+  }
+  return out;
+}
+const lookupName = (names, raw) => names[String(raw || "").toLowerCase()];
+
+/** A description saved with a RefMod or typed in a voice box, as one line
+ *  (a break reads as a shot cut) with no trailing full stop. */
+const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().replace(/[\s.]+$/, "");
+/** "low, husky voice" -> "a low, husky voice"; kept as typed with an article. */
+const withArticle = (t) => (/^(a|an|the)\s/i.test(t) ? t : (/^[aeiou]/i.test(t) ? "an " : "a ") + t);
+/** "a low, husky voice" -> "low, husky voice", for "in the … referenced from". */
+const noArticle = (t) => t.replace(/^(a|an|the)\s+/i, "");
+/** A voice-timbre line ties a speaker ID to a subject: "<Audio 1> is the
+ *  voice-timbre reference for <Subject 1> (S1), …". Singing lines don't
+ *  count. Returns { audio, subj, sx } or null. */
+function voiceBinding(text) {
+  const t = String(text || "");
+  const a = t.match(/^\s*<Audio (\d+)>/);
+  const s = t.match(/\((S\d+)\)/);
+  if (!a || !s || /singing/i.test(t)) return null;
+  const subj = t.match(/<Subject \d+>/);
+  return { audio: `<Audio ${a[1]}>`, subj: subj ? subj[0] : null, sx: s[1] };
+}
+
+/* Right-click a tag: the tags a text holds, and how to rewrite them. */
+
+/** Reference tags, !Name shorthand and speaker IDs in a text, in order. */
+function tagTokens(text) {
+  const t = String(text || ""), out = [];
+  for (const m of t.matchAll(/<(?:Subject|Picture|Video|Audio) \d+>/g))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  for (const m of t.matchAll(NAME_TOKEN_RE))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  for (const m of t.matchAll(/\(S\d+(?:\s*,\s*S\d+)*\)/g))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  return out.sort((a, b) => a.start - b.start);
+}
+const isSpk = (tok) => tok.startsWith("(");
+const spkIds = (tok) => tok.match(/S\d+/g) || [];
+/** "(S2,S1)" from ids, in number order; "" when none are left. */
+const spkTok = (ids) => {
+  const sorted = [...new Set(ids)].sort((a, b) => +a.slice(1) - +b.slice(1));
+  return sorted.length ? `(${sorted.join(",")})` : "";
+};
+/** Same tag: exact for labels, any case for names (!ann is !Ann), the same
+ *  IDs for speakers whatever the spacing. */
+const sameTok = (a, b) => {
+  if (isSpk(a) || isSpk(b)) return isSpk(a) && isSpk(b) && spkTok(spkIds(a)) === spkTok(spkIds(b));
+  return (a.startsWith("<") || b.startsWith("<")) ? a === b : a.toLowerCase() === b.toLowerCase();
+};
+/** Copies of a tag. A single speaker ID also counts inside group tags. */
+const countTok = (text, tok) => {
+  if (isSpk(tok) && spkIds(tok).length === 1)
+    return tagTokens(text).filter((t) => isSpk(t.tok) && spkIds(t.tok).includes(spkIds(tok)[0])).length;
+  return tagTokens(text).filter((t) => sameTok(t.tok, tok)).length;
+};
+const tagClass = (tok) => (tok.startsWith("<") ? tok.match(/^<(\w+)/)[1] : isSpk(tok) ? "Speaker" : "Name");
+const TAG_CLASS_LABEL = { Picture: "picture", Video: "video", Audio: "audio", Subject: "subject",
+  Name: "subject name", Speaker: "speaker ID" };
+
+/** Close the gaps removed tags leave behind. "!" is left alone: it starts
+ *  a name, and pulling it onto the previous word would break the name. */
+const tidyGaps = (t) => t.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([,.;:?)])/g, "$1")
+  .replace(/\(\s*\)/g, "").replace(/^[ \t]+|[ \t]+$/gm, "");
+
+/** Replace every copy of tok with target (remove it when target is null).
+ *  With swap, copies of target become `back` (tok as the prompt spells it). */
+function rewriteTokens(text, tok, target, swap, back = tok, ctx = null) {
+  let out = "", last = 0;
+  // One speaker ID is rewritten wherever it appears, group tags included:
+  // swapping S1 and S2 turns "(S1,S2)" into "(S2,S1)", removing S2 leaves "(S1)".
+  const byId = isSpk(tok) && spkIds(tok).length === 1 && (target == null || (isSpk(target) && spkIds(target).length === 1));
+  const from = byId ? spkIds(tok)[0] : null, to = byId && target != null ? spkIds(target)[0] : null;
+  if (byId && ctx) {
+    // A line from a speaker button — "!Ann (S1), in the low voice referenced
+    // from <Audio 1>, says:" — belongs to its speaker as a whole. When the ID
+    // changes hands, the name and voice clause follow the new speaker's voice
+    // line; removing the ID drops the clause and keeps the name. Only wording
+    // that matches the old speaker's voice line is touched.
+    const P = reEsc(ctx.prefix);
+    const re = new RegExp(`(?:${P}([A-Za-z][\\w-]*) )?\\((S\\d+)\\)(, in the [^<\\n]+? referenced from (<Audio \\d+>),)?`, "g");
+    text = text.replace(re, (m, name, id, clause, audio) => {
+      const Y = id === from ? to : (swap && id === to ? from : undefined);
+      if (Y === undefined) return m;
+      const bx = ctx.bindings[id] || null, by = Y ? ctx.bindings[Y] || null : null;
+      let who = name ? `${ctx.prefix}${name} ` : "";
+      if (Y && name && bx?.name && name.toLowerCase() === bx.name.toLowerCase())
+        who = by?.name ? `${ctx.prefix}${by.name} ` : "";
+      let how = clause || "";
+      if (clause && bx?.audio && audio === bx.audio)
+        how = Y && by?.voice && by?.audio ? `, in the ${noArticle(by.voice)} referenced from ${by.audio},` : "";
+      return who + (Y ? `(${Y})` : "") + how;
+    });
+  }
+  for (const t of tagTokens(text)) {
+    let rep = null;
+    if (byId && isSpk(t.tok)) {
+      const ids = spkIds(t.tok);
+      if (ctx && ids.length === 1) continue;           // handled with its line above
+      if (!ids.includes(from) && !(swap && to && ids.includes(to))) continue;
+      rep = spkTok(ids.map((id) => id === from ? to : (swap && id === to ? from : id)).filter(Boolean));
+    } else if (sameTok(t.tok, tok)) rep = target ?? "";
+    else if (swap && target != null && sameTok(t.tok, target)) rep = back;
+    if (rep === null) continue;
+    out += text.slice(last, t.start) + rep;
+    last = t.end;
+  }
+  out += text.slice(last);
+  return target == null ? tidyGaps(out) : out;
+}
+
+/** A single removed tag takes one neighbouring space with it. */
+function tidyRange(text, start, end) {
+  const before = text[start - 1], after = text[end];
+  if (before === " " && (after === undefined || after === " " || after === "\n" || /[,.;:?)]/.test(after)))
+    return { start: start - 1, end };
+  if (after === " " && (start === 0 || before === "\n" || before === "("))
+    return { start, end: end + 1 };
+  return { start, end };
+}
+
+/** Show a name suggestion in a chip field's mirror, at a text offset. A
+ *  partly typed !name is painted as its own chip, so the suggestion goes
+ *  after that chip rather than inside it. */
+function insertGhost(root, pos, text) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let seen = 0, node;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (seen + len >= pos) {
+      const off = pos - seen;
+      const ghost = el("span", { class: "mmh3-ghost" }, text);
+      const parent = node.parentNode;
+      if (off === len && parent !== root && parent.classList?.contains("mmh3-reftag")) { parent.after(ghost); return; }
+      parent.insertBefore(ghost, node.splitText(off));
+      return;
+    }
+    seen += len;
+  }
+}
+
+/** Edit a field through the browser so Ctrl+Z undoes it, falling back to
+ *  setting the value. Either way the field's own input handler runs. */
+function editField(box, start, end, text) {
+  const v = box.value, want = v.slice(0, start) + text + v.slice(end);
+  box.focus();
+  box.setSelectionRange(start, end);
+  let ok = false;
+  try { ok = document.execCommand(text ? "insertText" : "delete", false, text); } catch (e) { ok = false; }
+  if (!ok || box.value !== want) {
+    box.value = want;
+    box.setSelectionRange(start + text.length, start + text.length);
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
+
+/** Turn every !Name into "<Subject N> Name" — or just "Name" inside a
+ *  spoken <d> line, where a label would be read aloud. The name is written
+ *  as it was defined, whatever case was typed. Unknown names are left as
+ *  typed so the warning can point at them. */
+function expandNames(text, names) {
+  if (!text || !Object.keys(names).length) return text;
+  const parts = String(text).split(/(<d>[\s\S]*?<\/d>)/);
+  return parts.map((part, i) => part.replace(NAME_TOKEN_RE, (m, raw) => {
+    const hit = lookupName(names, raw);
+    return hit ? (i % 2 ? hit.name : `${hit.tag} ${hit.name}`) : m;
+  })).join("");
+}
 
 const LANG_RE = /^(\s*\[[^\]\n]+\])/;
 /* Every delivery tag, opening or closing, as one alternation — for picking
@@ -97,12 +292,22 @@ const LANG_RE = /^(\s*\[[^\]\n]+\])/;
 const DELIVERY_RE = new RegExp("(<\\/?(?:" + [...new Set(DELIVERY_TAGS.map((t) => t.tag.slice(1, -1)))]
   .sort((a, b) => b.length - a.length).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")>)", "g");
 
-/** Text with its delivery tags wrapped as .mmh3-dtag spans. */
-function deliverySpans(text) {
+/** Text with its delivery tags wrapped as .mmh3-dtag spans, and any !Name
+ *  shorthand as a subject tag (it becomes the bare name in a spoken line). */
+function deliverySpans(text, names = null) {
   // split() with a capture group alternates text, tag, text… — the parity
   // is what says which is which, so empties are dropped only afterwards.
   return String(text).split(DELIVERY_RE)
-    .map((part, i) => (i % 2 ? el("span", { class: "mmh3-dtag" }, part) : part))
+    .flatMap((part, i) => {
+      if (i % 2) return [el("span", { class: "mmh3-dtag" }, part)];
+      if (!names) return [part];
+      return part.split(NAME_SPLIT_RE).map((p, j) => {
+        if (!(j % 2)) return p;
+        const hit = lookupName(names, p.slice(1));
+        return el("span", { class: "mmh3-reftag " + (hit ? "subj" : "unknown"), dataset: { tag: p },
+          title: hit ? `just \u201c${hit.name}\u201d when spoken` : "No subject has this name" }, p);
+      });
+    })
     .filter((part) => part !== "");
 }
 
@@ -355,7 +560,7 @@ const ROLE_HINTS = [
 const REFMOD_CONCEPTS = {
   identity: { subject: true, marker: "fully_preserved", task: "reference generation",
     text: (c) => `${c.subj} is the person in ${c.tag}.`,
-    note: (c) => `${c.subj}'s identity and appearance from ${c.tag} are retained.` },
+    note: (c) => `${c.subj}'s identity and appearance from ${c.tag} are retained. Face, facial features, body type.` },
   clothing: { subject: true, marker: "attribute_transfer", task: "reference generation",
     text: (c) => `${c.subj} is the outfit in ${c.tag}.`,
     note: (c) => `the garments, colours and fit of ${c.subj} from ${c.tag} are transferred.` },
@@ -425,6 +630,8 @@ const PREF_DEFAULTS = {
   // Chips can be switched off for a plain text field. The mirror still
   // renders (invisibly), so hover previews keep working.
   highlightTags: true,
+  // The character before a subject's name that makes it shorthand (!Bob).
+  namePrefix: "!",
 };
 const SCALE_MIN = 1.0;
 const SCALE_MAX = 3.0;          // window
@@ -442,6 +649,7 @@ function loadPrefs() {
       ...JSON.parse(localStorage.getItem(PREF_KEY) || "{}") };
     v.windowScale = clampScale(v.windowScale);
     v.textScale = clampScale(v.textScale, TEXT_SCALE_MAX);
+    if (!NAME_PREFIXES.includes(v.namePrefix)) v.namePrefix = "!";
     return v;
   } catch (e) {
     return { ...PREF_DEFAULTS };
@@ -452,6 +660,9 @@ function savePrefs(prefs) {
   try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); }
   catch (e) { /* private mode: the session's choice still applies */ }
 }
+// Apply the saved name prefix as soon as the script loads, so a prompt
+// generated before any editor opens uses it too.
+setNamePrefix(loadPrefs().namePrefix);
 
 /** Turn a failed request into something actionable.
  *
@@ -1054,19 +1265,32 @@ function genBase(state) {
 
 function genRef(state) {
   const r = state.ref;
+  const names = subjectNames(state);
+  const ex = (t) => expandNames(t, names);
   const defs = r.subjectDefs
     .filter((d) => !d.off)
-    .map((d) => d.text.trim()).filter(Boolean).join("\n");
+    .map((d) => {
+      let line = d.text.trim();
+      const name = (d.name || "").trim();
+      // The name rides on the definition so the model ties it to the label.
+      if (line && name && /^<Subject \d+>/.test(line))
+        line = line.replace(/\.?\s*$/, "") + `. Their name is ${name}.`;
+      // A voice description rides on its voice line, after the drafted wording.
+      const voice = oneLine(d.voice);
+      if (line && voice && voiceBinding(line))
+        line = line.replace(/\.?\s*$/, "") + `. It is ${withArticle(voice)}.`;
+      return line;
+    }).filter(Boolean).join("\n");
   const types = TASK_TYPES.filter((t) => r.summaryTypes.includes(t)).join(" + ");
-  const summary = `[${types || "reference generation"}] ${r.summaryText.trim()}`;
+  const summary = `[${types || "reference generation"}] ${ex(r.summaryText.trim())}`;
   const retention = r.retention
     .filter((row) => row.label && !row.off)
     .map((row) => {
       const ctx = row.context?.trim() ? ` (${row.context.trim()})` : "";
-      return `${row.label}${ctx}: ${row.marker} - ${row.note.trim()}`;
+      return `${row.label}${ctx}: ${row.marker} - ${ex(row.note.trim())}`;
     })
     .join("\n");
-  const detail = [r.styleLine.trim(), r.detail.trim()].filter(Boolean).join("\n");
+  const detail = [ex(r.styleLine.trim()), ex(r.detail.trim())].filter(Boolean).join("\n");
   const on = (name) => sectionOn(state, name);
   const blocks = [];
   if (on("subject_definitions"))
@@ -1076,9 +1300,9 @@ function genRef(state) {
     blocks.push(`retention_analysis:\n${retention}`);
   blocks.push(`detailed_description:\n${detail}`);
   if (on("overall_soundscape"))
-    blocks.push(`overall_soundscape:\n${r.soundscape.trim()}`);
+    blocks.push(`overall_soundscape:\n${ex(r.soundscape.trim())}`);
   if (on("non_diegetic_music"))
-    blocks.push(`non_diegetic_music:\n${r.music.trim() || "N/A"}`);
+    blocks.push(`non_diegetic_music:\n${ex(r.music.trim()) || "N/A"}`);
   return blocks.join("\n\n");
 }
 
@@ -1273,6 +1497,22 @@ function validate(state, slots) {
       if (![...retLabels].some((l) => l === `<Subject ${n}>`))
         warn(`<Subject ${n}> has no retention_analysis entry.`);
     }
+    // !Name shorthand: every one used must belong to a named, switched-on subject.
+    const names = subjectNames(state);
+    const r = state.ref;
+    const used = new Set([...[r.summaryText, r.styleLine, r.detail, r.soundscape, r.music,
+      ...liveRet.map((x) => x.note)].join("\n").matchAll(NAME_TOKEN_RE)].map((m) => m[1]));
+    for (const nm of used) {
+      if (!lookupName(names, nm)) warn(`${NAME_PREFIX}${nm} is used, but no switched-on subject definition has the name "${nm}" \u2014 ` +
+        "give a subject that name, or write it out.");
+    }
+    liveDefs.forEach((d) => {
+      const nm = (d.name || "").trim();
+      if (nm && !/^[A-Za-z][\w-]*$/.test(nm))
+        warn(`Subject name "${nm}" can't be used as a ${NAME_PREFIX}tag \u2014 letters, digits, - and _ only, no spaces.`);
+      else if (nm && !/^<Subject \d+>/.test((d.text || "").trim()))
+        warn(`The name "${nm}" is on a line that doesn't start with <Subject N>, so it isn't used.`);
+    });
     // The guide requires the marker to sit inside the role the definition
     // already states, so a plain contradiction is worth flagging.
     liveRet.forEach((row) => {
@@ -1462,6 +1702,7 @@ const CSS = `
   border-radius:6px;cursor:pointer;}
 .mmh3-prefitem:hover{background:#242a34;}
 .mmh3-prefitem input{margin-top:2px;flex-shrink:0;}
+.mmh3-prefselect select{flex:0 0 auto;margin-top:1px;}
 .mmh3-preflabel{display:block;font-size:calc(12px * var(--mmh3-fs, 1));color:#d7dbe2;}
 .mmh3-prefhint{display:block;font-size:calc(10px * var(--mmh3-fs, 1));color:#6b7484;line-height:1.35;
   margin-top:2px;}
@@ -1497,6 +1738,36 @@ const CSS = `
 .mmh3-ctxitem{padding:7px 10px;border-radius:6px;font-size:calc(12px * var(--mmh3-fs, 1));color:#d7dbe2;
   cursor:pointer;white-space:nowrap;}
 .mmh3-ctxitem:hover{background:#2a313d;}
+.mmh3-tagpick{position:absolute;z-index:10006;width:350px;background:#1b1f27;border:1px solid #3a4252;border-radius:9px;
+  padding:9px;box-shadow:0 12px 32px rgba(0,0,0,.5);color:#d7dbe2;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tagpickhead{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.mmh3-tagpicktag{font-family:ui-monospace,monospace;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tagpickgrow{flex:1;}
+.mmh3-tagpickrow{display:flex;align-items:center;gap:6px;margin-bottom:7px;}
+.mmh3-tagpicklbl{width:56px;flex:0 0 auto;color:#8a93a3;font-size:calc(10.5px * var(--mmh3-fs, 1));}
+.mmh3-tagseg{display:inline-flex;border:1px solid #3a4252;border-radius:6px;overflow:hidden;}
+.mmh3-tagseg button{background:#12151b;border:0;border-right:1px solid #3a4252;color:#8a93a3;padding:3px 8px;
+  font-size:calc(11px * var(--mmh3-fs, 1));cursor:pointer;font-family:inherit;}
+.mmh3-tagseg button:last-child{border-right:0;}
+.mmh3-tagseg button.on{background:#2b3140;color:#d7dbe2;}
+.mmh3-tagseg button:disabled{opacity:.4;cursor:default;}
+.mmh3-tagpickgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:8px;
+  max-height:250px;overflow:auto;}
+.mmh3-tagpickopt{display:flex;flex-direction:column;gap:3px;min-width:0;text-align:left;background:#12151b;
+  border:1px solid #2e3440;border-radius:7px;padding:5px;cursor:pointer;color:#d7dbe2;font-family:inherit;}
+.mmh3-tagpickopt:hover{border-color:#6f86b8;background:#1b2230;}
+.mmh3-tagpickthumb{position:relative;height:48px;border-radius:5px;overflow:hidden;background:#0d1015;display:flex;align-items:center;
+  justify-content:center;color:#6b7484;font-weight:600;font-size:calc(11px * var(--mmh3-fs, 1));}
+.mmh3-tagpickthumb .mmh3-thumb{width:100%;height:100%;object-fit:cover;display:block;border-radius:0;}
+.mmh3-tagpicknm{font-family:ui-monospace,monospace;font-size:calc(10.5px * var(--mmh3-fs, 1));white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;}
+.mmh3-tagpickun{position:absolute;left:3px;top:3px;padding:0 4px;border-radius:4px;background:rgba(18,21,27,.85);
+  border:1px solid rgba(224,169,76,.55);color:#e0a94c;font-family:system-ui,sans-serif;font-weight:500;
+  font-size:calc(9px * var(--mmh3-fs, 1));line-height:1.4;}
+.mmh3-tagpicksub{color:#6b7484;font-size:calc(10px * var(--mmh3-fs, 1));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.mmh3-tagpickfoot{display:flex;align-items:center;gap:8px;border-top:1px solid #2a2f3a;padding-top:8px;}
+.mmh3-tagpicknote{color:#8a93a3;font-size:calc(10.5px * var(--mmh3-fs, 1));}
+.mmh3-tagpicknone{color:#8a93a3;padding:4px 2px 10px;font-size:calc(11px * var(--mmh3-fs, 1));}
 .mmh3-phraseover{z-index:10004;display:flex;align-items:center;
   justify-content:center;}
 .mmh3-phrasemodal{width:min(520px,92vw);background:#191c22;
@@ -1561,6 +1832,23 @@ const CSS = `
 .mmh3-btn.ghost:hover{color:#e05a5a;}
 .mmh3-defrow{display:flex;gap:6px;margin-bottom:6px;align-items:flex-start;}
 .mmh3-defrow textarea{flex:1;min-height:38px;}
+.mmh3-form .mmh3-defrow textarea{flex:1 1 auto;min-width:0;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname{width:110px;flex:0 0 110px;min-width:0;align-self:flex-start;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname[hidden]{display:none;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname.mmh3-defvoice{width:190px;flex:0 0 190px;}
+.mmh3-spksplit{display:inline-flex;}
+.mmh3-spksplit .mmh3-spkmain{border-top-right-radius:0;border-bottom-right-radius:0;}
+.mmh3-spksplit .mmh3-spkarrow{border-top-left-radius:0;border-bottom-left-radius:0;border-left:0;padding-left:5px;padding-right:5px;}
+.mmh3-spkmenu{position:absolute;z-index:10006;min-width:300px;max-width:480px;background:#1b1f27;border:1px solid #3a4252;
+  border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.45);}
+.mmh3-spkitem{display:block;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:7px 9px;
+  color:#d7dbe2;cursor:pointer;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-spkitem:hover{background:#262c36;}
+.mmh3-spkitem small{display:block;margin-top:3px;color:#8e97a6;font-family:ui-monospace,monospace;
+  font-size:calc(11px * var(--mmh3-fs, 1));white-space:normal;}
+.mmh3-spkitem.off{cursor:default;opacity:.6;}
+.mmh3-spkitem.off:hover{background:none;}
+.mmh3-chipname{color:#a9b2c2;font-size:calc(10px * var(--mmh3-fs, 1));}
 .mmh3-minitags{display:flex;gap:4px;flex-wrap:wrap;margin:-2px 0 8px 2px;min-height:14px;}
 .mmh3-minitag{font-size:calc(10px * var(--mmh3-fs, 1));border-radius:8px;padding:1px 7px;background:#20242d;border:1px solid #363d4a;}
 .mmh3-minitag.pic{color:#e0a94c;border-color:#8a6a2c;}
@@ -1708,6 +1996,8 @@ const CSS = `
 .mmh3-chipwrap.plain textarea.mmh3-chiptext::selection{
   background:rgba(96,140,210,.45);color:#fff;}
 .mmh3-chipwrap.plain .mmh3-chipmirror{color:transparent;}
+/* A name suggestion after the caret: grey in both modes, Tab fills it in. */
+.mmh3-chipmirror .mmh3-ghost,.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-ghost{color:#6b7484;}
 .mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-reftag,
 .mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dblock,
 .mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dmark,
@@ -1992,6 +2282,17 @@ function draftIdFor(node) {
   return node.properties.mmh3_draft_id;
 }
 
+/** RefMod presets: a saved stack, kept by the same routes shape. */
+async function refmodPresetApi(path, body) {
+  const resp = await postApi("/minimax_h3/refmod_presets" + path, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
+  return data;
+}
+
 async function presetApi(path, body) {
   const resp = await postApi("/minimax_h3/presets" + path, {
     headers: { "Content-Type": "application/json" },
@@ -2213,17 +2514,78 @@ class Library {
       }
     })();
 
-    /** Returns { media_preset, media_digest } for the save body, creating
-     *  the preset first when the user asked for a new one. */
-    const resolveLink = async () => {
-      if (!linkBox.checked || link.mode === "none") return {};
-      if (link.mode === "existing") {
-        return { media_preset: link.preset, media_digest: link.digest };
+    // RefMod link, the same way: decided by what the stack holds (or the
+    // draft's own picks), matched against the saved RefMod presets.
+    const rlinkBox = el("input", { type: "checkbox" });
+    const rlinkNew = el("input", { type: "text", class: "mmh3-linkname",
+      placeholder: "new preset name\u2026" });
+    const rlinkRow = el("label", { class: "mmh3-linkrow" },
+      el("span", { class: "mmh3-linktext" }, "checking RefMods\u2026"));
+    const rlink = { mode: "none", preset: null, digest: null, picks: null };
+
+    (async () => {
+      let picks = [];
+      try {
+        if (ed.bufferMode === "draft") picks = ed.draftRefmodsView() || [];
+        else { const { stack } = refmodStackFor(ed.node); picks = stack ? readStack(stack).picks : []; }
+      } catch (e2) { picks = []; }
+      const live = picks.filter((p) => p && p.on !== false);
+      if (!live.length) { rlinkRow.style.display = "none"; return; }
+      let match;
+      try { match = await refmodPresetApi("/match", { picks }); }
+      catch (e2) { rlinkRow.style.display = "none"; return; }
+      rlink.picks = picks;
+      rlink.digest = match.digest;
+      const count = `${live.length} RefMod${live.length === 1 ? "" : "s"}`;
+      if (match.name) {
+        rlink.mode = "existing";
+        rlink.preset = match.name;
+        rlinkBox.checked = true;
+        rlinkRow.replaceChildren(rlinkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Linked to RefMods \u2014 " + match.name),
+            el("span", { class: "mmh3-linknote" },
+              `The stack (${count}, with weights) is saved as this preset. ` +
+              "Loading this prompt will offer to load it too.")));
+      } else {
+        rlink.mode = "new";
+        rlinkNew.value = (name.value || "").trim();
+        rlinkRow.replaceChildren(rlinkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Link to RefMods \u2014 new preset"),
+            el("span", { class: "mmh3-linknote" },
+              `The stack (${count}, with weights) isn't saved as a preset yet. ` +
+              "Name it and it will be saved and linked to this prompt.")),
+          rlinkNew);
       }
-      const pname = linkNew.value.trim();
-      if (!pname) throw new Error("Give the media preset a name, or untick it.");
-      const res = await presetApi("/save", { name: pname, items: link.items });
-      return { media_preset: res.name, media_digest: link.digest };
+    })();
+
+    /** Returns the link fields for the save body — media_preset and
+     *  refmod_preset with their digests — creating a preset first when the
+     *  user asked for a new one. */
+    const resolveLink = async () => {
+      const out = {};
+      if (linkBox.checked && link.mode !== "none") {
+        if (link.mode === "existing") {
+          out.media_preset = link.preset; out.media_digest = link.digest;
+        } else {
+          const pname = linkNew.value.trim();
+          if (!pname) throw new Error("Give the media preset a name, or untick it.");
+          const res = await presetApi("/save", { name: pname, items: link.items });
+          out.media_preset = res.name; out.media_digest = link.digest;
+        }
+      }
+      if (rlinkBox.checked && rlink.mode !== "none") {
+        if (rlink.mode === "existing") {
+          out.refmod_preset = rlink.preset; out.refmod_digest = rlink.digest;
+        } else {
+          const pname = rlinkNew.value.trim();
+          if (!pname) throw new Error("Give the RefMod preset a name, or untick it.");
+          const res = await refmodPresetApi("/save", { name: pname, picks: rlink.picks });
+          out.refmod_preset = res.name; out.refmod_digest = res.digest || rlink.digest;
+        }
+      }
+      return out;
     };
 
     // Saving under a different name used to be treated as a rename, which
@@ -2303,6 +2665,7 @@ class Library {
         el("button", { class: "mmh3-btn",
           onclick: () => { this.saveOpen = false; this.paint(); } }, "Cancel")),
       linkRow,
+      rlinkRow,
       err);
   }
 
@@ -2433,6 +2796,12 @@ class Library {
           e.media_preset
             ? this.mediaBadge(e.media_preset, e.media_counts)
             : null,
+          e.refmod_preset
+            ? el("span", { class: "mmh3-libmedia", title: "Linked RefMod preset: loading this prompt offers to load it too" },
+                el("span", { class: "mmh3-libkind" }, "\u25c8", e.refmod_count != null ? String(e.refmod_count) : ""),
+                el("span", { class: "mmh3-libsep" }, "\u00b7"),
+                el("span", { class: "mmh3-libpname" }, e.refmod_preset))
+            : null,
           el("span", { class: "mmh3-libage" }, ago(e.updated))),
         el("div", { class: "mmh3-libprev" }, e.preview || "(empty)")),
       el("div", { class: "mmh3-libacts" },
@@ -2467,6 +2836,9 @@ class Library {
       this.editor.noteLibraryIdentity();
       if (data.media_preset) {
         this.editor.offerLinkedMedia(data.media_preset, data.media_digest);
+      }
+      if (data.refmod_preset) {
+        this.editor.offerLinkedRefmods(data.refmod_preset, data.refmod_digest);
       }
       this.editor.render();
       toast(`Loaded "${entry.name}"`);
@@ -2618,6 +2990,7 @@ class Editor {
     this.clearPending = false;
     this.closePending = false;
     this.prefs = loadPrefs();
+    setNamePrefix(this.prefs.namePrefix);
     this.prefsOpen = false;
     // Draft mode. "live" edits the node's prompt as ever; "draft" edits a
     // disk-backed scratch buffer that is never queued or executed. The two
@@ -2812,6 +3185,14 @@ class Editor {
       if (!box || typeof box.value !== "string") return;
       const a = box.selectionStart ?? 0;
       const b = box.selectionEnd ?? 0;
+      // On a tag: replace, swap or remove it. A selection reaching beyond
+      // that one tag keeps the phrase menu.
+      const hit = this.tagUnderPointer(e, box);
+      if (hit && (b <= a || (a >= hit.start && b <= hit.end))) {
+        e.preventDefault();
+        this.openTagMenu(e.clientX, e.clientY, box, hit);
+        return;
+      }
       if (b <= a) return;                       // no selection: native menu
       e.preventDefault();
       this.openCtx(e.clientX, e.clientY, box.value.slice(a, b));
@@ -2844,6 +3225,7 @@ class Editor {
       // A window opened from here owns Escape: the Media Loader, the RefMod
       // Stack or library, or a crop editor.
       if (document.querySelector(".mml-overlay, .mmr-overlay, .mml-tmover")) return;
+      if (this._tagMenu) { this.closeTagMenu(); return; }
       // A strip is already asking a question; Escape shouldn't answer it.
       if (this.closePending || this.clearPending || this.linkOffer) return;
       this.requestClose();
@@ -3072,6 +3454,20 @@ class Editor {
       item("highlightTags", "Highlight tags and dialogue",
            "Off gives plain text fields; hovering a tag still shows its " +
            "preview."),
+      el("label", { class: "mmh3-prefitem mmh3-prefselect" },
+        el("select", { "aria-label": "Subject name prefix",
+          onchange: (e) => {
+            this.prefs.namePrefix = e.target.value;
+            savePrefs(this.prefs);
+            setNamePrefix(this.prefs.namePrefix);
+            this.render();
+          } },
+          NAME_PREFIXES.map((c) => el("option", { value: c, selected: c === this.prefs.namePrefix }, `${c}Name`))),
+        el("span", {},
+          el("span", { class: "mmh3-preflabel" }, "Subject name prefix"),
+          el("span", { class: "mmh3-prefhint" },
+            "Typed before a subject's name, it stands for \u201c<Subject N> Name\u201d. " +
+            "Changing it doesn't rewrite shorthand you've already typed."))),
       item("closeOnBackdrop", "Click outside to close",
            "Off means only \u2715, Cancel and Escape close the window."),
       item("saveOnClose", "Save to node when closing",
@@ -3629,6 +4025,78 @@ class Editor {
     this.render();
   }
 
+  async offerLinkedRefmods(presetName, savedDigest) {
+    let info = null;
+    try {
+      info = await refmodPresetApi("/load", { name: presetName });
+    } catch (e) {
+      toast(`This prompt is linked to RefMod preset \u201c${presetName}\u201d, which no longer exists.`, 7000);
+      return;
+    }
+    this.refmodOffer = {
+      name: presetName,
+      picks: info.picks || [],
+      missing: info.missing || [],
+      changed: !!(savedDigest && info.digest && savedDigest !== info.digest),
+    };
+    this.render();
+  }
+
+  refmodLinkStrip() {
+    const o = this.refmodOffer;
+    if (!o) return null;
+    const drafting = this.bufferMode === "draft";
+    let current = 0;
+    try {
+      if (drafting) current = (this.draftRefmodsView() || []).length;
+      else { const { stack } = refmodStackFor(this.node); current = stack ? readStack(stack).picks.length : 0; }
+    } catch (e) { current = 0; }
+    const target = drafting ? "this draft's RefMods" : "the RefMod Stack";
+    const n = o.picks.filter((p) => p.on !== false).length;
+    return el("div", { class: "mmh3-commitstrip" },
+      el("span", { class: "mmh3-commitmsg" },
+        `This prompt is linked to RefMod preset \u201c${o.name}\u201d ` +
+        `(${n} RefMod${n === 1 ? "" : "s"}, with weights). ` +
+        `Loading it replaces ${current} in ${target}.`,
+        o.changed
+          ? el("span", { class: "mmh3-linkwarn" },
+              " \u26a0 That preset has changed since this prompt was saved, " +
+              "so its labels may no longer line up with the tags in the text.")
+          : null,
+        o.missing.length
+          ? el("span", { class: "mmh3-linkwarn" },
+              ` \u26a0 ${o.missing.length} file(s) in the preset are missing from the library.`)
+          : null),
+      el("div", { class: "mmh3-commitrow" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.applyLinkedRefmods() }, "Load the RefMods too"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.refmodOffer = null; this.render(); } },
+          "Prompt only")));
+  }
+
+  applyLinkedRefmods() {
+    const o = this.refmodOffer;
+    this.refmodOffer = null;
+    if (!o) return;
+    const picks = JSON.parse(JSON.stringify(o.picks));
+    if (this.bufferMode === "draft") {
+      // The draft takes the set as its own; it reaches the stack on commit.
+      if (this.draftEntry) {
+        const v = validateDraftRefmods(picks);
+        this.draftEntry.refmods = v.items || [];
+        if (v.dropped) this.draftDropped = (this.draftDropped || 0) + v.dropped;
+        this.draftRefmodsStale = this._refmodsDiverged();
+        this.flushDraftSave();
+      }
+    } else {
+      this._applyRefmodSnapshot(picks);
+    }
+    this.refreshSlots();
+    this.render();
+    toast(`Loaded RefMod preset \u201c${o.name}\u201d`);
+  }
+
   linkStrip() {
     const o = this.linkOffer;
     if (!o) return null;
@@ -4015,6 +4483,10 @@ class Editor {
       // The trailing newline keeps the mirror's last line height in step with
       // the textarea's when the text ends mid-line.
       mirror.append(document.createTextNode(text.slice(last) + "\n"));
+      // Typing a subject's name: the rest of it, greyed after the caret.
+      const g = box._ghost = this.nameSuggestion(box);
+      box._ghostKey = g ? `${g.pos}|${g.name}` : "";
+      if (g) insertGhost(mirror, g.pos, g.name.slice(g.typed));
       syncBox();
     };
 
@@ -4035,8 +4507,30 @@ class Editor {
       mirror.scrollLeft = box.scrollLeft;
     };
 
+    box.addEventListener("input", () => { box._ghostOff = false; });
     box.addEventListener("input", paint);
     box.addEventListener("scroll", syncBox);
+    // The suggestion follows the caret, and Tab takes it.
+    const caretMoved = () => {
+      const g = this.nameSuggestion(box);
+      if ((g ? `${g.pos}|${g.name}` : "") !== (box._ghostKey || "")) paint();
+    };
+    ["keyup", "click", "focus"].forEach((ev) => box.addEventListener(ev, caretMoved));
+    box.addEventListener("blur", () => { if (box._ghostKey) paint(); });
+    box.addEventListener("keydown", (e) => {
+      const g = box._ghost;
+      if (!g) return;
+      if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        editField(box, g.pos - g.typed, g.pos, g.name);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();            // hides the suggestion, not the editor
+        box._ghostOff = true;
+        paint();
+      }
+    });
     // Dragging the resize grip can add or remove the scrollbar.
     if (typeof ResizeObserver === "function") {
       new ResizeObserver(syncBox).observe(box);
@@ -4052,6 +4546,24 @@ class Editor {
     return wrap;
   }
 
+  /** A subject name to finish: the caret sits right after "!cas" and a
+   *  switched-on subject is named castle_with_moat. First match
+   *  alphabetically when several start the same way. */
+  nameSuggestion(box) {
+    if (box._ghostOff || document.activeElement !== box) return null;
+    const pos = box.selectionStart;
+    if (pos == null || pos !== box.selectionEnd) return null;
+    const v = box.value || "";
+    if (/[\w-]/.test(v[pos] || "")) return null;          // mid-word: nothing to finish
+    const m = v.slice(0, pos).match(new RegExp(`(?:^|[^\\w])${reEsc(NAME_PREFIX)}([A-Za-z][\\w-]*)$`));
+    if (!m) return null;
+    const typed = m[1], low = typed.toLowerCase();
+    const hits = Object.values(subjectNames(this.state)).map((n) => n.name)
+      .filter((n) => n.length > typed.length && n.toLowerCase().startsWith(low))
+      .sort((a, b) => a.localeCompare(b));
+    return hits.length ? { pos, typed: typed.length, name: hits[0] } : null;
+  }
+
   /** Render one matched token as the spans the mirror shows. */
   paintToken(tok) {
     if (tok.startsWith("<d>")) {
@@ -4060,7 +4572,7 @@ class Editor {
       const lang = inner.match(LANG_RE);
       const body = lang ? inner.slice(lang[0].length) : inner;
       if (lang) kids.push(el("span", { class: "mmh3-dlang" }, lang[1]));
-      kids.push(el("span", { class: "mmh3-dtext" }, ...deliverySpans(body)));
+      kids.push(el("span", { class: "mmh3-dtext" }, ...deliverySpans(body, subjectNames(this.state))));
       kids.push(el("span", { class: "mmh3-dmark" }, "</d>"));
       return [el("span", { class: "mmh3-dblock" }, ...kids)];
     }
@@ -4069,6 +4581,11 @@ class Editor {
     }
     if (tok.startsWith("(")) {
       return [el("span", { class: "mmh3-reftag spk", dataset: { tag: tok } }, tok)];
+    }
+    if (tok.startsWith(NAME_PREFIX) && !tok.startsWith("<")) {
+      const hit = lookupName(subjectNames(this.state), tok.slice(1));
+      return [el("span", { class: "mmh3-reftag " + (hit ? "subj" : "unknown"), dataset: { tag: tok },
+        title: hit ? `${hit.tag} ${hit.name} in the prompt` : "No subject has this name" }, tok)];
     }
     let cls;
     if (tok.startsWith("<Subject")) {
@@ -4111,7 +4628,7 @@ class Editor {
     const slot = tags.map((t) => this.slotFor(t))
       .find((sl) => sl && sl.preview?.url && sl.preview.type === "img")
       || tags.map((t) => this.slotFor(t)).find((sl) => sl && sl.preview?.url);
-    return { slot, tags, voices, speakers, line };
+    return { slot, tags, voices, speakers, line, name: (line.name || "").trim() };
   }
 
   slotFor(tag) {
@@ -4133,6 +4650,17 @@ class Editor {
     this.chipLeave();
     const tag = hit.dataset.tag;
     let slot = null, subject = null;
+    if (tag.startsWith(NAME_PREFIX) && !tag.startsWith("<")) {
+      // The shorthand shows the subject it stands for.
+      const named = lookupName(subjectNames(this.state), tag.slice(1));
+      if (!named) return;
+      subject = this.subjectInfo(named.tag);
+      if (!subject) return;
+      slot = subject.slot;
+      this._chipOpenFor = tag;
+      this._chipTimer = setTimeout(() => this.openChipPeek(hit, slot, named.tag, subject), 180);
+      return;
+    }
     if (tag.startsWith("<Subject")) {
       subject = this.subjectInfo(tag);
       if (!subject) return;                  // undefined subject: nothing to show
@@ -4177,6 +4705,7 @@ class Editor {
       ? el("div", { class: "mmh3-chippeekcap col" },
           el("span", { class: "mmh3-chiprow" },
             el("span", { class: "mmh3-tagname subj" }, tag),
+            subject.name ? el("span", { class: "mmh3-chipname" }, subject.name) : null,
             subject.speakers.length
               ? el("span", { class: "mmh3-chipspk" }, subject.speakers.join(" "))
               : null),
@@ -4300,7 +4829,9 @@ class Editor {
     } catch (e) { /* the concept picker covers the gap */ }
     const infoOf = (file) => {
       const it = library.find((x) => x.visual?.file === file || x.audio?.file === file);
-      return { concept: it?.concept || "generic" };
+      const nm = String(it?.subject_name || "").trim();
+      return { concept: it?.concept || "generic", subjectName: /^[A-Za-z][\w-]{0,39}$/.test(nm) ? nm : "",
+        appearance: oneLine(it?.appearance), voiceDesc: oneLine(it?.voice_description) };
     };
     // Group each RefMod's look and voice; a voice-only RefMod has no look.
     const mods = [];
@@ -4313,13 +4844,50 @@ class Editor {
       // or the voice's when the RefMod is a voice only.
       if (s.refmod.role !== "voice" || !m.file) m.file = file;
     }
+    // A RefMod's saved subject name goes on its subject line when that line
+    // has no name of its own yet — including lines drafted before the name
+    // was set in the library. A name you typed is never replaced.
+    const nameLines = (dry = false) => {
+      let named = 0;
+      for (const m of mods) {
+        if (m.subjectName && m.look) {
+          const line = r.subjectDefs.find((d) => !(d.name || "").trim() && /^\s*<Subject \d+>/.test(d.text || "")
+            && (d.text || "").includes(m.look.tag));
+          if (line) { if (!dry) line.name = m.subjectName; named++; }
+        }
+        // A saved voice description fills the voice box on the RefMod's voice line.
+        if (m.voiceDesc && m.voice) {
+          const line = r.subjectDefs.find((d) => !oneLine(d.voice) && voiceBinding(d.text)
+            && (d.text || "").includes(m.voice.tag));
+          if (line) { if (!dry) line.voice = m.voiceDesc; named++; }
+        }
+      }
+      return named;
+    };
+    let how = null;
+    {
+      const citedNow = (tag) => r.subjectDefs.some((d) => (d.text || "").includes(tag));
+      const nothingNew = !mods.some((m) => (m.look && !citedNow(m.look.tag)) || (m.voice && !citedNow(m.voice.tag)));
+      if (nothingNew) {
+        // Every RefMod already has a line: nothing to add, but the two
+        // sections can still be drafted fresh, or blank names filled.
+        how = await this.askOverwrite({ complete: true, names: nameLines(true) });
+        if (!how) return;
+        if (how === "keep") {
+          const named = nameLines();
+          this.render();
+          toast(`Filled ${named} name or voice box${named === 1 ? "" : "es"} from the library`, 4000);
+          return;
+        }
+      }
+    }
     // Existing lines: add to them, or start the two sections over.
     const hasText = r.subjectDefs.some((d) => (d.text || "").trim()) || r.retention.some((x) => x.label);
-    if (hasText) {
-      const how = await this.askOverwrite();
+    if (hasText && !how) {
+      how = await this.askOverwrite();
       if (!how) return;
-      if (how === "replace") { r.subjectDefs = []; r.retention = []; }
     }
+    if (how === "replace") { r.subjectDefs = []; r.retention = []; }
     const defText = () => r.subjectDefs.map((d) => d.text).join("\n");
     const cited = (tag) => defText().includes(tag);
     const pending = mods.filter((m) => (m.look && !cited(m.look.tag)) || (m.voice && !cited(m.voice.tag)));
@@ -4360,7 +4928,11 @@ class Editor {
         const spec = REFMOD_CONCEPTS[m.concept] || REFMOD_CONCEPTS.identity;
         subj = spec.subject ? nextSubject() : null;
         const ctx = { subj, tag: m.look.tag };
-        r.subjectDefs.push({ text: spec.text(ctx), role: null });
+        let text = spec.text(ctx);
+        // A saved appearance goes straight into a subject's line, where it can be edited.
+        const looks = m.appearance.replace(/^with\s+/i, "");
+        if (spec.subject && looks) text = text.replace(/\.\s*$/, "") + `, with ${looks}.`;
+        r.subjectDefs.push({ text, role: null });
         ensureRet(subj || m.look.tag, spec.marker, spec.note(ctx));
         ensureTask(spec.task);
         added++;
@@ -4375,35 +4947,49 @@ class Editor {
         if (spec.speaker && !subj) {
           // A voice with no look of its own still needs someone to belong to.
           subj = nextSubject();
-          r.subjectDefs.push({ text: spec.speaker({ subj, tag: m.voice.tag }), role: null });
+          r.subjectDefs.push({ text: spec.speaker({ subj, tag: m.voice.tag }), role: null, name: m.subjectName || "" });
           ensureRet(subj, "fully_preserved", `${subj}'s identity is retained.`);
         }
         const ctx = { subj: subj || "<Subject 1>", tag: m.voice.tag, sx: nextSpeaker() };
-        r.subjectDefs.push({ text: spec.text(ctx), role: vc === "voice" ? "timbre" : null });
+        r.subjectDefs.push({ text: spec.text(ctx), role: vc === "voice" ? "timbre" : null,
+          voice: vc === "voice" ? (m.voiceDesc || "") : "" });
         ensureRet(m.voice.tag, spec.marker, spec.note(ctx));
         ensureTask(spec.task);
         added++;
       }
     }
+    nameLines();                                  // saved names onto the lines just written
     this.render();
     toast(`Drafted ${added} definition line${added === 1 ? "" : "s"} and their retention entries \u2014 read them over`, 5000);
   }
 
-  /** Lines already exist: resolves to "add", "replace" or null (cancelled). */
-  askOverwrite() {
+  /** Lines already exist: resolves to "add", "replace" or null (cancelled).
+   *  With `complete`, every RefMod already has a line, so there is nothing to
+   *  add: it offers "replace", and "keep" (fill `names` blank name boxes)
+   *  when there are names to fill. */
+  askOverwrite({ complete = false, names = 0 } = {}) {
     return new Promise((resolve) => {
       const close = (result) => { window.removeEventListener("keydown", onKey); box.remove(); resolve(result); };
       const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(null); } };
       const box = el("div", { class: "mmh3-conceptover", onmousedown: (e) => { if (e.target === box) close(null); } },
         el("div", { class: "mmh3-conceptbox", role: "dialog", "aria-label": "Definitions already exist" },
-          el("div", { class: "mmh3-concepthead" }, "You already have definitions"),
+          el("div", { class: "mmh3-concepthead" },
+            complete ? "Every RefMod already has a definition" : "You already have definitions"),
           el("div", { class: "mmh3-dim" },
-            "Add missing keeps every line you have and drafts only the RefMods that don't have one yet. " +
-            "Start over clears subject_definitions and retention_analysis and drafts them fresh from the RefMods."),
+            complete
+              ? "Start over clears ALL of subject_definitions and retention_analysis, including lines for other media, " +
+                "and drafts them fresh from the RefMods." +
+                (names ? ` Fill names and voices keeps your lines and fills ${names} empty name or voice ` +
+                         `box${names === 1 ? "" : "es"} with what's saved in the library.` : "")
+              : "Add missing keeps every line you have and drafts only the RefMods that don't have one yet. " +
+                "Start over clears ALL of subject_definitions and retention_analysis, including lines for other media, " +
+                "and drafts them fresh from the RefMods."),
           el("div", { class: "mmh3-conceptbtns" },
             el("button", { class: "mmh3-btn", onclick: () => close(null) }, "Cancel"),
             el("button", { class: "mmh3-btn danger", onclick: () => close("replace") }, "Start over"),
-            el("button", { class: "mmh3-btn primary", onclick: () => close("add") }, "Add missing"))));
+            !complete ? el("button", { class: "mmh3-btn primary", onclick: () => close("add") }, "Add missing")
+              : names ? el("button", { class: "mmh3-btn primary", onclick: () => close("keep") }, "Fill names and voices")
+              : null)));
       window.addEventListener("keydown", onKey);
       document.body.append(box);
     });
@@ -5151,6 +5737,318 @@ class Editor {
     }
   }
 
+  /* --- right-click a tag: replace, swap or remove ------------------- */
+
+  /** Reference mode: each voice-timbre line ties a speaker ID to its
+   *  subject, that subject's name, the audio tag and, when filled in, a
+   *  description of the voice. { S1: { audio, subj, sx, name, voice } } */
+  speakerBindings() {
+    const binds = {};
+    if (this.state.mode !== "REF") return binds;
+    const names = subjectNames(this.state);
+    for (const d of this.state.ref?.subjectDefs || []) {
+      const b = !d.off && voiceBinding(d.text);
+      if (!b || binds[b.sx]) continue;
+      const named = b.subj ? Object.values(names).find((n) => n.tag === b.subj) : null;
+      binds[b.sx] = { ...b, name: named ? named.name : "", voice: oneLine(d.voice) };
+    }
+    return binds;
+  }
+
+  /** Every string in this mode's prompt a tag can sit in. */
+  tagTexts() {
+    const st = this.state, out = [];
+    const add = (obj, key, where = "") => { if (obj && typeof obj[key] === "string") out.push({ obj, key, where }); };
+    if (st.mode === "REF") {
+      const r = st.ref;
+      (r.subjectDefs || []).forEach((d) => add(d, "text", "def"));
+      ["summaryText", "styleLine", "detail", "soundscape", "music"].forEach((k) => add(r, k));
+      (r.retention || []).forEach((row) => { add(row, "label", "label"); add(row, "context"); add(row, "note"); });
+    } else {
+      ["imd", "soundscape", "music"].forEach((k) => add(st, k));
+    }
+    return out;
+  }
+
+  /** The tag under a right-click: read off the painted chips where the
+   *  field has them, else from where the click put the caret. */
+  tagUnderPointer(e, box) {
+    const toks = tagTokens(box.value);
+    if (!toks.length) return null;
+    const mirror = box.closest(".mmh3-chipwrap")?.querySelector(".mmh3-chipmirror");
+    if (mirror) {
+      const chips = [...mirror.querySelectorAll(".mmh3-reftag[data-tag]")];
+      const hit = chips.find((c) => {
+        const r = c.getBoundingClientRect();
+        return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      });
+      if (!hit) return null;
+      const same = toks.filter((t) => sameTok(t.tok, hit.dataset.tag));
+      const k = chips.filter((c) => sameTok(c.dataset.tag, hit.dataset.tag)).indexOf(hit);
+      return same[Math.max(0, Math.min(k, same.length - 1))] || null;
+    }
+    const a = box.selectionStart ?? -1, b = box.selectionEnd ?? a;
+    if (a < 0) return null;
+    return toks.find((t) => a >= t.start && a <= t.end && b <= t.end) || null;
+  }
+
+  /** Nothing in the prompt cites it. A subject's own definition line and a
+   *  retention label don't count as citing it. */
+  tagUnused(tok, texts = this.tagTexts()) {
+    for (const t of texts) {
+      if (t.where === "label" || (isSpk(tok) && t.where === "def")) continue;
+      const v = t.obj[t.key] || "";
+      let n = countTok(v, tok);
+      if (t.where === "def" && tok.startsWith("<Subject") && v.trim().startsWith(tok)) n -= 1;
+      if (n > 0) return false;
+    }
+    return true;
+  }
+
+  /** Other tags of the same kind, unused ones first. */
+  tagChoices(tok) {
+    const cls = tagClass(tok), texts = this.tagTexts(), list = [];
+    if (cls === "Name") {
+      for (const n of Object.values(subjectNames(this.state)))
+        list.push({ tok: NAME_PREFIX + n.name, sub: n.tag, slot: this.subjectInfo(n.tag)?.slot || null, initial: n.name[0] });
+    } else if (cls === "Subject") {
+      const seen = new Set();
+      for (const d of this.state.ref?.subjectDefs || []) {
+        const m = (d.text || "").match(/^\s*(<Subject \d+>)/);
+        if (!m || seen.has(m[1])) continue;
+        seen.add(m[1]);
+        const nm = (d.name || "").trim();
+        list.push({ tok: m[1], sub: nm || "no name", slot: this.subjectInfo(m[1])?.slot || null, initial: nm ? nm[0] : "S" });
+      }
+    } else if (cls === "Speaker") {
+      // Voice lines say who each speaker is; group tags only offer groups.
+      const single = spkIds(tok).length === 1, bindings = {}, names = subjectNames(this.state);
+      for (const d of this.state.ref?.subjectDefs || []) {
+        const b = !d.off && voiceBinding(d.text);
+        if (b && !bindings[b.sx]) bindings[b.sx] = b;
+      }
+      const seen = new Map();
+      for (const t of texts) for (const k of tagTokens(t.obj[t.key] || "")) {
+        if (!isSpk(k.tok)) continue;
+        const ids = spkIds(k.tok);
+        if (single && ids.length !== 1) continue;
+        if (!seen.has(spkTok(ids))) seen.set(spkTok(ids), ids);
+      }
+      if (single) Object.keys(bindings).forEach((sx) => { if (!seen.has(`(${sx})`)) seen.set(`(${sx})`, [sx]); });
+      for (const [norm, ids] of seen) {
+        const b = ids.length === 1 ? bindings[ids[0]] : null;
+        const named = b?.subj ? Object.values(names).find((n) => n.tag === b.subj) : null;
+        list.push({ tok: norm, sub: ids.length > 1 ? "speaking together" : (named ? named.name : b?.subj || "no voice line"),
+          slot: b?.subj ? this.subjectInfo(b.subj)?.slot || null : null, initial: ids.join("+") });
+      }
+      if (single) {
+        const used = new Set([...seen.values()].flat());
+        let i = 1;
+        while (used.has(`S${i}`)) i++;
+        list.push({ tok: `(S${i})`, sub: "new speaker", slot: null, initial: `S${i}`, fresh: true });
+      }
+    } else {
+      for (const s of this.slots || []) {
+        if (!s.tag || !s.tag.startsWith(`<${cls} `)) continue;
+        const src = s.refmod?.name || String(s.source || "").split("•").pop().trim() || s.note || "";
+        list.push({ tok: s.tag, sub: src, slot: s, initial: cls.slice(0, 3).toUpperCase() });
+      }
+    }
+    return list.filter((o) => !sameTok(o.tok, tok))
+      .map((o) => ({ ...o, unused: !o.fresh && this.tagUnused(o.tok, texts) }))
+      .sort((a, b) => b.unused - a.unused);
+  }
+
+  /** Carry out a choice from the tag menu; returns what happened. */
+  applyTagEdit(box, hit, scope, mode, target) {
+    const tok = hit.tok;
+    const swap = mode === "swap" && target != null && scope !== "this";
+    const named = tagClass(tok) === "Name" ? lookupName(subjectNames(this.state), tok.slice(1)) : null;
+    const back = named ? NAME_PREFIX + named.name : isSpk(tok) ? spkTok(spkIds(tok)) : tok;
+    const verb = target == null ? "Removed" : swap ? "Swapped" : "Replaced";
+    const what = target == null ? back : swap ? `${back} and ${target}` : `${back} with ${target}`;
+    // A speaker's name and voice clause go with its ID — except when swapping
+    // IDs everywhere, which renumbers the voice lines too and changes nobody.
+    const oneSpk = isSpk(tok) && spkIds(tok).length === 1 && (target == null || spkIds(target).length === 1);
+    const ctx = oneSpk && !(scope === "all" && swap) ? { bindings: this.speakerBindings(), prefix: NAME_PREFIX } : null;
+    if (scope === "this") {
+      if (ctx) {
+        const v = box.value;
+        let s0 = hit.start, e0 = hit.end;
+        const pre = v.slice(0, s0).match(new RegExp(`${reEsc(NAME_PREFIX)}[A-Za-z][\\w-]* $`));
+        if (pre) s0 -= pre[0].length;
+        const post = v.slice(e0).match(/^, in the [^<\n]+? referenced from <Audio \d+>,/);
+        if (post) e0 += post[0].length;
+        const text = rewriteTokens(v.slice(s0, e0), tok, target, false, back, ctx);
+        const r = text === "" ? tidyRange(v, s0, e0) : { start: s0, end: e0 };
+        editField(box, r.start, r.end, text);
+      } else {
+        const r = target == null ? tidyRange(box.value, hit.start, hit.end) : hit;
+        editField(box, r.start, r.end, target ?? "");
+      }
+      this.lastFocus = box;
+      return `${verb} ${what}`;
+    }
+    if (scope === "field") {
+      const v = box.value, n = countTok(v, tok) + (swap ? countTok(v, target) : 0);
+      editField(box, 0, v.length, rewriteTokens(v, tok, target, swap, back, ctx));
+      this.lastFocus = box;
+      return `${verb} ${what} in this field (${n})`;
+    }
+    let n = 0, dropped = 0;
+    const r = this.state.ref;
+    if (target == null && tok.startsWith("<") && this.state.mode === "REF") {
+      // Removing a label everywhere takes the lines that define it too, or
+      // they'd be left reading "is the man in…".
+      const before = r.subjectDefs.length + r.retention.length;
+      r.subjectDefs = r.subjectDefs.filter((d) => !(d.text || "").trim().startsWith(tok));
+      r.retention = r.retention.filter((row) => row.label !== tok);
+      dropped = before - r.subjectDefs.length - r.retention.length;
+    }
+    for (const t of this.tagTexts()) {
+      const v = t.obj[t.key] || "";
+      const c = countTok(v, tok) + (swap ? countTok(v, target) : 0);
+      if (!c) continue;
+      n += c;
+      t.obj[t.key] = rewriteTokens(v, tok, target, swap, back, ctx);
+    }
+    this.render();
+    return `${verb} ${what} everywhere (${n})` +
+      (dropped ? ` and deleted ${dropped} line${dropped === 1 ? "" : "s"} defining it` : "");
+  }
+
+  /** The tag menu: other tags of the same kind to put in its place, how
+   *  far the change reaches, and Remove. */
+  openTagMenu(x, y, box, hit) {
+    this.closeTagMenu();
+    this.chipLeave();
+    this.closeCtx();
+    const tok = hit.tok, cls = tagClass(tok);
+    const st = { scope: "this", mode: "replace" };
+    const host = this.overlay.querySelector(".mmh3-modal") || document.body;
+    const menu = el("div", { class: "mmh3-tagpick", role: "dialog", "aria-label": `Replace ${tok}` });
+    const chipCls = cls === "Name" || cls === "Subject" ? "subj" : cls === "Speaker" ? "spk" : (this.slotFor(tok)?.cls || "unknown");
+    const thumb = (o) => {
+      const wrap = el("span", { class: "mmh3-tagpickthumb" });
+      if (o.slot?.preview?.url) wrap.append(this.mediaThumb(o.slot));
+      else wrap.append(o.initial || "?");
+      if (o.unused || o.fresh) wrap.append(el("span", { class: "mmh3-tagpickun",
+        title: o.fresh ? "The next speaker ID not used anywhere yet" : "Nothing in the prompt cites this yet" }, o.fresh ? "new" : "unused"));
+      return wrap;
+    };
+    const place = () => {
+      const pr = (menu.offsetParent || document.body).getBoundingClientRect();
+      const w = menu.offsetWidth, h = menu.offsetHeight;
+      let left = x - pr.left, top = y - pr.top + 8;
+      left = Math.max(8, Math.min(left, pr.width - w - 8));
+      if (top + h > pr.height - 8) top = Math.max(8, y - pr.top - h - 8);
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+    };
+    const paint = () => {
+      const texts = this.tagTexts();
+      const inField = countTok(box.value, tok);
+      const everywhere = texts.reduce((n, t) => n + countTok(t.obj[t.key] || "", tok), 0);
+      const choices = this.tagChoices(tok);
+      const seg = (key, val, label, disabled = false, title = "") => el("button", {
+        type: "button", class: st[key] === val ? "on" : "", disabled, title,
+        onclick: (e) => { e.stopPropagation(); st[key] = val; if (st.scope === "this") st.mode = "replace"; paint(); },
+      }, label);
+      const go = (target) => {
+        const msg = this.applyTagEdit(box, hit, st.scope, st.mode, target);
+        this.closeTagMenu();
+        toast(msg, 3500);
+      };
+      let note = st.mode === "swap" ? "Swap exchanges both tags" : "Unused tags first";
+      if (st.scope === "all" && tok.startsWith("<") && this.state.mode === "REF") {
+        const r = this.state.ref;
+        const lines = r.subjectDefs.filter((d) => (d.text || "").trim().startsWith(tok)).length +
+          r.retention.filter((row) => row.label === tok).length;
+        if (lines) note = `Remove also deletes the ${lines} line${lines === 1 ? "" : "s"} defining it`;
+      }
+      menu.replaceChildren(
+        el("div", { class: "mmh3-tagpickhead" },
+          el("span", { class: `mmh3-reftag ${chipCls} mmh3-tagpicktag` }, tok),
+          el("span", { class: "mmh3-tagpicknote" }, TAG_CLASS_LABEL[cls]),
+          el("span", { class: "mmh3-tagpickgrow" }),
+          el("button", { type: "button", class: "mmh3-btn ghost", title: "Close", onclick: () => this.closeTagMenu() }, "✕")),
+        el("div", { class: "mmh3-tagpickrow" },
+          el("span", { class: "mmh3-tagpicklbl" }, "Apply to"),
+          el("span", { class: "mmh3-tagseg" },
+            seg("scope", "this", "This tag"),
+            seg("scope", "field", `Field (${inField})`),
+            seg("scope", "all", `Everywhere (${everywhere})`))),
+        el("div", { class: "mmh3-tagpickrow" },
+          el("span", { class: "mmh3-tagpicklbl" }, "Action"),
+          el("span", { class: "mmh3-tagseg" },
+            seg("mode", "replace", "Replace"),
+            seg("mode", "swap", "Swap", st.scope === "this",
+              st.scope === "this" ? "Swap needs Field or Everywhere — on one tag it's the same as Replace"
+                : "Exchange the two tags"))),
+        choices.length
+          ? el("div", { class: "mmh3-tagpickgrid" }, choices.map((o) => el("button", {
+              type: "button", class: "mmh3-tagpickopt",
+              title: `${st.mode === "swap" && st.scope !== "this" ? "Swap with" : "Replace with"} ${o.tok}`,
+              onclick: () => go(o.tok) },
+              thumb(o),
+              el("span", { class: "mmh3-tagpicknm" }, o.tok),
+              el("span", { class: "mmh3-tagpicksub" }, o.sub))))
+          : el("div", { class: "mmh3-tagpicknone" }, `No other ${TAG_CLASS_LABEL[cls]} to put in its place.`),
+        el("div", { class: "mmh3-tagpickfoot" },
+          el("button", { type: "button", class: "mmh3-btn danger", onclick: () => go(null) }, "Remove"),
+          el("span", { class: "mmh3-tagpicknote" }, note)));
+      place();
+    };
+    host.append(menu);
+    paint();
+    const onDown = (e) => { if (!menu.contains(e.target)) this.closeTagMenu(); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); this.closeTagMenu(); } };
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    this._tagMenu = { menu, onDown, onKey };
+  }
+
+  closeTagMenu() {
+    const m = this._tagMenu;
+    if (!m) return;
+    m.menu.remove();
+    document.removeEventListener("mousedown", m.onDown, true);
+    window.removeEventListener("keydown", m.onKey, true);
+    this._tagMenu = null;
+  }
+
+  /** The speaker button's menu: a plain line, or one that names the voice.
+   *  Kept inside the editor, so a click in it doesn't count as outside. */
+  openSpeakerMenu(anchor, id, b, line, pick) {
+    this._spkMenu?.close();
+    const host = anchor.closest(".mmh3-modal") || document.body;
+    let menu;
+    const close = () => {
+      menu?.remove();
+      document.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+      this._spkMenu = null;
+    };
+    const onDown = (e) => { if (!menu.contains(e.target) && !anchor.contains(e.target)) close(); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); close(); } };
+    const item = (label, text, enabled, onpick) => el("button", {
+      class: "mmh3-spkitem" + (enabled ? "" : " off"), type: "button",
+      onclick: (e) => { e.stopPropagation(); if (!enabled) return; close(); onpick(); },
+    }, el("b", {}, label), el("small", {}, text));
+    menu = el("div", { class: "mmh3-spkmenu", role: "menu" },
+      item(`Just (${id})`, line(id, false), true, () => pick(false)),
+      item(`(${id}) with voice`, b.voice ? line(id, true) : `Fill in the voice box on the ${b.audio} line first`,
+        !!b.voice, () => pick(true)));
+    host.append(menu);
+    const pr = (menu.offsetParent || document.body).getBoundingClientRect();
+    const ar = anchor.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(ar.left - pr.left, pr.width - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${ar.bottom - pr.top + 4}px`;
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    this._spkMenu = { close };
+  }
+
   dialogueRow(lang) {
     this.dialogueLang = lang;          // reused by refreshDialogueRow()
     const used = this.usedSpeakers();
@@ -5164,10 +6062,15 @@ class Editor {
       onclick: () => { this.voiceover = !this.voiceover; this.render(); },
     }, "\u{1F399} voiceover");
 
-    const line = (id) => {
+    const binds = this.speakerBindings();
+
+    const line = (id, withVoice = false) => {
+      const b = binds[id];
+      const who = b?.name ? `${NAME_PREFIX}${b.name} ` : "";
+      const how = withVoice && b?.voice ? `, in the ${noArticle(b.voice)} referenced from ${b.audio},` : "";
       const said = this.voiceover
-        ? `(${id}) says in an off-screen voiceover: `
-        : `(${id}) says: `;
+        ? `${who}(${id})${how} says in an off-screen voiceover: `
+        : `${who}(${id})${how} says: `;
       const tail = this.voiceover
         ? " while their lips remain completely closed."
         : "";
@@ -5177,13 +6080,34 @@ class Editor {
       return `${said}<d>[${lang.value}] </d>${tail}`;
     };
 
-    const spkBtn = (id, isNew) => el("button", {
-      class: "mmh3-btn" + (isNew ? " ghost" : ""),
-      title: isNew
-        ? `Add ${id} \u2014 the next speaker in the video's speaking order`
-        : `Insert a line for ${id}`,
-      onclick: () => this.insert(line(id)),
-    }, isNew ? `+ (${id})` : `(${id})`);
+    const spkBtn = (id, isNew) => {
+      const b = !isNew && binds[id];
+      if (!b) return el("button", {
+        class: "mmh3-btn" + (isNew ? " ghost" : ""),
+        title: isNew
+          ? `Add ${id} \u2014 the next speaker in the video's speaking order`
+          : `Insert a line for ${id}`,
+        onclick: () => this.insert(line(id)),
+      }, isNew ? `+ (${id})` : `(${id})`);
+      // A split button: the main part repeats this speaker's last choice,
+      // the arrow offers a plain line or one that names the voice. Each
+      // speaker remembers its own choice, saved with the prompt.
+      const picks = this.state.ref.voicePick || {};
+      const withVoice = picks[id] !== false && !!b.voice;
+      const pick = (voice) => {
+        this.state.ref.voicePick = { ...(this.state.ref.voicePick || {}), [id]: voice };
+        this.insert(line(id, voice));
+        this.refreshDialogueRow();
+      };
+      const arrow = el("button", { class: "mmh3-btn mmh3-spkarrow", title: `Line options for ${id}`,
+        "aria-label": `Line options for ${id}`,
+        onclick: (e) => { e.stopPropagation(); this.openSpeakerMenu(arrow, id, b, line, pick); } }, "\u25be");
+      return el("span", { class: "mmh3-spksplit" },
+        el("button", { class: "mmh3-btn mmh3-spkmain",
+          title: withVoice ? `Insert a line for ${id} in the voice from ${b.audio}` : `Insert a line for ${id}`,
+          onclick: () => this.insert(line(id, withVoice)) }, withVoice ? `(${id}) + voice` : `(${id})`),
+        arrow);
+    };
 
     const pair = used.length >= 2
       ? el("button", { class: "mmh3-btn",
@@ -5282,6 +6206,7 @@ class Editor {
     // you're looking at. Drawing it last made it the first casualty.
     this.draftSlot.replaceChildren(
       this.linkOffer ? this.linkStrip()
+        : this.refmodOffer ? this.refmodLinkStrip()
         : this.commitPending === "guard" ? this.commitStrip()
         : this.pullPending ? this.pullStrip()
         : (this.bufferMode === "draft" ? this.draftBar() : null) || "");
@@ -5378,10 +6303,20 @@ class Editor {
     const subjChips = () => {
       const defText = r.subjectDefs.map((d) => d.text).join("\n");
       const ns = [...new Set([...defText.matchAll(/<Subject (\d+)>/g)].map((m) => m[1]))];
-      return ns.map((n) => el("span", {
-        class: "mmh3-chip subj", title: `Insert <Subject ${n}>`,
-        onclick: () => this.insert(`<Subject ${n}>`),
-      }, el("b", {}, `Subject ${n}`)));
+      const names = subjectNames(this.state);
+      const nameOf = (n) => Object.values(names).find((v) => v.tag === `<Subject ${n}>`)?.name;
+      return ns.flatMap((n) => {
+        const nm = nameOf(n);
+        const chips = [el("span", {
+          class: "mmh3-chip subj", title: `Insert <Subject ${n}>`,
+          onclick: () => this.insert(`<Subject ${n}>`),
+        }, el("b", {}, `Subject ${n}`), nm ? el("span", { class: "mmh3-chipname" }, nm) : null)];
+        if (nm) chips.push(el("span", {
+          class: "mmh3-chip subj", title: `Insert ${NAME_PREFIX}${nm} \u2014 becomes "<Subject ${n}> ${nm}" in the prompt`,
+          onclick: () => this.insert(`${NAME_PREFIX}${nm}`),
+        }, el("b", {}, `${NAME_PREFIX}${nm}`)));
+        return chips;
+      });
     };
     const subjChipWrap = el("span", { style: { display: "contents" } });
     this._paintSubjChips = () => subjChipWrap.replaceChildren(...subjChips());
@@ -5484,10 +6419,24 @@ class Editor {
         };
         const ta = el("textarea", { rows: 2, value: d.text,
           placeholder: "<Subject 1> is the ... in <Picture 1>, with ...",
-          oninput: (e) => { d.text = e.target.value; d.role = null; paintMini(); } });
+          oninput: (e) => { d.text = e.target.value; d.role = null; paintMini(); nameIn.hidden = !/^\s*<Subject \d+>/.test(d.text); voiceIn.hidden = !voiceBinding(d.text); } });
+        // A name rides on a <Subject N> line: the prompt adds "Their name
+        // is X." and !X anywhere else becomes "<Subject N> X".
+        const nameIn = el("input", { class: "mmh3-defname", type: "text", value: d.name || "",
+          placeholder: "name", title: "Optional name for this subject. The prompt adds \u201cTheir name is \u2026\u201d " +
+            `to the line, and typing ${NAME_PREFIX}Name in any field stands for \u201c<Subject N> Name\u201d.`,
+          hidden: !/^\s*<Subject \d+>/.test(d.text || ""),
+          oninput: (e) => { keepNameChars(e); d.name = e.target.value.trim(); this._paintSubjChips?.(); this.updatePreview(); } });
+        // A voice description rides on a voice-timbre line: the prompt adds
+        // "It is a …", and the speaker button can put it into a spoken line.
+        const voiceIn = el("input", { class: "mmh3-defname mmh3-defvoice", type: "text", value: d.voice || "",
+          placeholder: "voice, like low and husky", title: "Optional description of this voice. The prompt adds " +
+            "“It is a …” to the line, and the speaker button can insert it into a spoken line.",
+          hidden: !voiceBinding(d.text || ""),
+          oninput: (e) => { d.voice = e.target.value; this.updatePreview(); this.refreshDialogueRow(); } });
         paintMini();
         const row = el("div", { class: "mmh3-defrow" + (d.off ? " off" : "") },
-          this.rowPower(d, drawDefs), ta,
+          this.rowPower(d, drawDefs), ta, nameIn, voiceIn,
           el("button", { class: "mmh3-btn ghost", title: "Remove line",
             onclick: () => { r.subjectDefs.splice(i, 1); drawDefs(); this.updatePreview(); },
           }, "\u2715"));

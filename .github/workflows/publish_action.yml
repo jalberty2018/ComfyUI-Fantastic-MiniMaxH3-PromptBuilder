@@ -16,7 +16,7 @@ jobs:
     # before the version-bump push, since registry versions are immutable.
     env:
       COMFY_NODE_CHANGELOG: |
-        Fixes for RefMods made from video clips: Create and Edit now take the first frames of the clip on H3's real frame grid (22 frames store 7, 39 store 12, 56 store 17) instead of evenly spaced picks that stored only 2, with a live readout under Clip frames. Deleting a RefMod closes its details panel. Reads the single-file bundles saved by ComfyUI-MiniMaxH3Mod 0.2.6.
+        A new RefMod Stack node with twelve fixed slots, per-channel sliders labelled with their tags, position badges and a Size control; it never resizes on its own. RefMod presets save a stack with its weights, and prompts can link to them. Chained stacks show their position and upstream labels. Right-click any tag, name or speaker ID to replace, swap or remove it in one place, one field or everywhere. Start typing a subject name and press Tab to fill it in.
     steps:
       - name: Check out code
         uses: actions/checkout@v4
