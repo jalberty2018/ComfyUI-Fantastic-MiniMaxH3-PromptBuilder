@@ -91,8 +91,19 @@ understands RefMods:
   Latent node either.
 - **width**, **height**, **length** and **ref_image_size** are the same
   settings Reference to Video has, and they mean the same thing.
+- **stack_pictures** (experimental) sets how many pictures of a RefMod
+  made from several the text encoder sees: every 4th (the default), up to
+  8, or all. More pictures may help lock in identity and reduce bleeding
+  between RefMods, but they increase memory use and generation time.
 - **reference_map** is a text output listing every label and where it
   came from. Handy for checking with a preview node.
+
+To show a RefMod to H3's text encoder, the Text Encode needs it as pictures.
+RefMods made or edited with a VAE keep those frames inside their file,
+so it never has to decode them. Older ones get them from the library's
+**Store encoder frames**. Until then they're decoded the first time they're
+used and kept in `input/minimax_h3/cache`, where the Media Loader's
+**Clean up…** lists them; deleting them only means one more decode.
 
 Media from a Media Loader still works through it, so you can mix RefMods
 with one-off pictures and clips in the same prompt. There's more on that
@@ -153,7 +164,7 @@ portrait, landscape or square. The first photo is marked *Sets dataset
 size and aspect ratio*.
 
 - Put your best-framed photo at the top. Drag rows to reorder.
-- Each preview shows what will be cut off, or how the photo gets squeezed
+- Each preview shows what will be cut off
   to fit.
 - To choose which part is kept instead of taking the middle, click
   **Crop to fit…** on a photo. The box is locked to the right aspect ratio, so
@@ -210,12 +221,20 @@ source.
 Creating runs in the ComfyUI queue like any other job, so you can watch
 it there. When it's done, the new RefMod appears in the library.
 
+Closing the library part-way through doesn't lose the work. Whether you
+click outside the window, press Escape or hit **Close**, your sources,
+names, descriptions and any edit in progress are kept, and the next time
+you open the library — **Browse library…**, **Create…** or an empty slot —
+it comes back where you left it. **Start fresh** on the Create tab clears
+it. A page reload starts clean.
+
 ---
 
 ## Saving and organising
 
 Everything you create is saved automatically. Open **Browse library…** to
-see it all.
+see it all. **⤡ Size** at the library's top right sets its window and text
+size, and it's remembered for next time.
 
 ![A RefMod's details panel](docs/refmods/04-details.png)
 
@@ -236,9 +255,13 @@ Click **Details** on a card to open its panel. From there you can:
   file, and drafting fills it in for you (see
   [Give the subject a name](#let-the-editor-write-them-for-you)). You can
   also set it on the Create tab as you make one, or in edit mode.
-- Describe its **Appearance** and **Voice**. Both are saved inside the file,
-  and drafting puts them into the prompt.
+- Describe its **Appearance**, **Retained attributes** and **Voice**. All
+  three are saved inside the file, and drafting puts them into the prompt.
 - **Replace preview** to set a nicer thumbnail.
+- **Store encoder frames**, for a RefMod saved before RefMods kept the
+  pictures the text encoder is shown, so the Text Encode doesn't have to
+  decode it. The button beside the sort menu does every RefMod still
+  missing them.
 - **Delete** it. You'll be asked to click twice.
 
 Click **Save changes** when you're done.
@@ -271,7 +294,8 @@ jobs already running in your ComfyUI queue have finished.
 - **Replace the voice**: drop in a new audio file.
 - **Remove the voice**: untick the stored voice row.
 - **Name and describe the subject**: fill in or clear **Subject name**,
-  **Appearance** and **Voice** in the settings on the right. If that's all
+  **Appearance**, **Retained attributes** and **Voice** in the settings on
+  the right. If that's all
   you change, only the file's header is rewritten.
 
 Editing never re-encodes what's already in a RefMod. Frames you keep are
@@ -314,7 +338,14 @@ Each card has:
   copy makes generation heavier.
 - **An on/off switch** to leave a RefMod out without removing it.
 - **⋯** for strength-times-copies mode and the card's details, and **×**
-  to remove it. Drag the handle at the left to reorder.
+  to remove it.
+- **The thumbnail and the name** open the library on that RefMod's details
+  pane, where you can rename it, describe it, look at what's stored or
+  edit it.
+
+**Reordering.** Drag a card by its handle, thumbnail or name and drop it on
+another card to take that place, or on an empty slot to go last. Escape
+part-way through puts it back. The handle also takes arrow keys.
 
 The header shows how many of the twelve slots are used and the token
 total. The footer lists the labels the prompt should use.
@@ -426,6 +457,9 @@ A name you've typed yourself stays.
 **Describe them, too.** A RefMod's saved **Appearance** is drafted straight
 into its subject line:
 `<Subject 1> is the person in <Video 1>, with shoulder-length auburn hair and a green wool coat.`
+Its **Retained attributes**, for the small details the model should hold on
+to, close the subject's `retention_analysis` note:
+`<Subject 1>'s identity and appearance from <Video 1> are retained. Face, facial features, body type. A small rose tattoo on her left wrist.`
 Its **Voice** goes in the small voice box beside its `<Audio N>` line, and
 the prompt adds *It is a low, husky voice with a slow, warm pace.*
 
@@ -447,8 +481,9 @@ if a label is sent but never used.
 You can use a **Media Loader** and RefMods together. Media from the loader
 is numbered first, then the RefMods after it. So one picture in the loader
 plus a RefMod gives you `<Picture 1>` from the loader, then `<Video 1>` and
-`<Audio 1>` from the RefMod. The editor's chips always show the real
-numbers, so go by those.
+`<Audio 1>` from the RefMod. The editor's chips and the stack's cards
+both show the real numbers, with or without the Prompt Builder in between,
+so go by those. (The stack's `labels` output counts the RefMods alone.)
 
 Use **+ Media loader** and **+ RefMods** on the builder, and both get
 wired through for you.
@@ -509,6 +544,7 @@ are the same format both ways: RefMods made here load in that pack, and
 its RefMods load here. That includes the single-file **bundles** its
 0.2.6 release can save: they show up in the library with a *bundle* badge,
 using the first look and first voice inside, and can be used and inspected
-here but not edited. The library's layout took cues from FranckyB's
+here. Editing one saves a copy as standalone files and leaves the bundle as
+it is. The library's layout took cues from FranckyB's
 [ComfyUI-H3RefMods](https://github.com/FranckyB/ComfyUI-H3RefMods).
 

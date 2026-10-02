@@ -22,6 +22,8 @@ class FakeResponse:
         self.data = data
         self.status = status
         self.headers = headers or {}
+        self.method = "POST"
+        self.path = "/test"
 
 
 class FakeRoutes:
@@ -45,6 +47,8 @@ class FakeRoutes:
 class FakeRequest:
     def __init__(self, headers=None):
         self.headers = headers or {}
+        self.method = "POST"
+        self.path = "/test"
 
 
 package = types.ModuleType(PACKAGE)
@@ -87,8 +91,10 @@ class RouteTokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.data["token"], web_api._TOKEN)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
-        response = await handler(FakeRequest({"Sec-Fetch-Site": "cross-site"}))
-        self.assertEqual(response.status, 403)
+        for site in ("cross-site", "same-site"):
+            with self.subTest(site=site):
+                response = await handler(FakeRequest({"Sec-Fetch-Site": site}))
+                self.assertEqual(response.status, 403)
 
     async def test_every_post_route_requires_the_session_token(self):
         self.assertGreater(len(routes.posts), 0)

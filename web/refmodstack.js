@@ -6,10 +6,11 @@
  */
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { postApi, LOADER_NAME, INPUT_LOADER_NAME, viewURL, openCropEditor, keepNameChars, outputTargets, setterOf,
+import { postApi, LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL, openCropEditor, keepNameChars, outputTargets, setterOf,
          clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX } from "./medialoader.js";
 
 export const STACK_NAME = "MiniMaxH3RefModStack";
+const BUILDER_NAME = "MiniMaxH3PromptBuilder";
 // Either pack's Text Encode labels a bundle the same way.
 export const ENCODE_NAMES = new Set(["MiniMaxH3FantasticRefModTextEncode",
   "MiniMaxH3RefModTextEncode"]);
@@ -26,18 +27,67 @@ const SLOTS = 12;
 const NODE_W = 600;
 const PANEL_H = 620;
 
-/* Node and text scale, remembered per user like the Media Loader's. */
+/* Node, library window and text scale, remembered per user like the Media Loader's. */
 const STACK_SCALE_KEY = "mmh3.stackScale";
+const LIBRARY_SCALE_KEY = "mmh3.libraryScale";
 
-function loadStackScale() {
+/** The stored scale under `key`: { [size]: factor, text: factor }, where
+ *  `size` is "node" for the stack and "window" for the library. */
+function loadScale(key, size) {
   try {
-    const v = JSON.parse(localStorage.getItem(STACK_SCALE_KEY) || "{}");
-    return { node: clampScale(v.node ?? 1), text: clampScale(v.text ?? 1, TEXT_SCALE_MAX) };
-  } catch (e) { return { node: 1, text: 1 }; }
+    const v = JSON.parse(localStorage.getItem(key) || "{}");
+    return { [size]: clampScale(v[size] ?? 1), text: clampScale(v.text ?? 1, TEXT_SCALE_MAX) };
+  } catch (e) { return { [size]: 1, text: 1 }; }
 }
 
-function saveStackScale(prefs) {
-  try { localStorage.setItem(STACK_SCALE_KEY, JSON.stringify(prefs)); } catch (e) { /* private mode */ }
+function saveScale(key, prefs) {
+  try { localStorage.setItem(key, JSON.stringify(prefs)); } catch (e) { /* private mode */ }
+}
+
+/** The popover under a ⤡ Size button: a size slider and a text-size slider.
+ *  Sliders and typed numbers set pending values, and nothing moves until
+ *  Apply or Reset. `prefs` holds the applied values under `size` and
+ *  `text`; `commit(s, t)` saves and applies them. */
+function sizeMenu(prefs, size, sizeLabel, note, commit) {
+  const pending = { [size]: prefs[size], text: prefs.text };
+  const inputs = {}, outs = {};
+  const dirty = () => applyBtn.classList.toggle("primary", pending[size] !== prefs[size] || pending.text !== prefs.text);
+  const maxFor = (key) => key === "text" ? TEXT_SCALE_MAX : SCALE_MAX;
+  const slider = (key, label) => {
+    const out = el("input", { type: "number", class: "mmr-scaleval",
+      min: String(Math.round(SCALE_MIN * 100)), max: String(Math.round(maxFor(key) * 100)), step: "5",
+      value: String(Math.round(pending[key] * 100)),
+      onchange: (e) => {
+        pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
+        const shown = Math.round(pending[key] * 100);
+        e.target.value = String(shown); input.value = String(shown); dirty();
+      },
+      onkeydown: (e) => { if (e.key === "Enter") e.target.blur(); } });
+    const input = el("input", { type: "range", class: "mmr-scalerange",
+      min: String(Math.round(SCALE_MIN * 100)), max: String(Math.round(maxFor(key) * 100)), step: "5",
+      value: String(Math.round(pending[key] * 100)),
+      oninput: (e) => {
+        pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
+        out.value = String(Math.round(pending[key] * 100)); dirty();
+      } });
+    inputs[key] = input; outs[key] = out;
+    return el("label", { class: "mmr-scalerow" }, el("span", { class: "mmr-scalelabel" }, label), input, out,
+      el("span", { class: "mmr-scalepct" }, "%"));
+  };
+  const set = (s, t) => {
+    prefs[size] = s; prefs.text = t; pending[size] = s; pending.text = t;
+    inputs[size].value = outs[size].value = String(Math.round(s * 100));
+    inputs.text.value = outs.text.value = String(Math.round(t * 100));
+    commit(s, t);
+    applyBtn.classList.remove("primary");
+  };
+  const applyBtn = el("button", { class: "mmr-btn mmr-sm", onclick: (e) => { e.stopPropagation(); set(pending[size], pending.text); } }, "Apply");
+  return el("div", { class: "mmr-scalemenu", onmousedown: (e) => e.stopPropagation() },
+    slider(size, sizeLabel), slider("text", "Text size"),
+    el("div", { class: "mmr-scalefoot" },
+      el("span", {}, note),
+      el("button", { class: "mmr-btn mmr-sm", onclick: (e) => { e.stopPropagation(); set(1, 1); } }, "Reset"),
+      applyBtn));
 }
 
 /** Size the node to a scale factor. With growOnly (workflow load) a node
@@ -79,7 +129,7 @@ function applyStackText(panel, factor) {
 }
 
 function applyStoredStackScale(node, { force = false } = {}) {
-  const sp = loadStackScale();
+  const sp = loadScale(STACK_SCALE_KEY, "node");
   applyStackText(node._mmrPanel, sp.text);
   applyStackSize(node, sp.node, { growOnly: !force });
 }
@@ -127,6 +177,38 @@ function chainOf(node) {
     cur = next;
   }
   return { up, down, partial };
+}
+
+/** How many labels of each kind Text Encode gives Media Loader media, which
+ *  it numbers before any RefMod: the loader on the references input of the
+ *  Text Encode this chain feeds, directly or through a Prompt Builder. */
+function mediaBefore(node, chain) {
+  const counts = { image: 0, video: 0, audio: 0 };
+  const modsOut = (n) => (n.outputs || []).findIndex((o) => o.name === "mods");
+  const refsIn = (n) => (n.inputs || []).findIndex((x) => x.name === "references");
+  const last = chain.down.length ? chain.down[chain.down.length - 1] : node;
+  const enc = outputTargets(last, modsOut(last))
+    .flatMap((t) => t.type === BUILDER_NAME ? outputTargets(t, modsOut(t)) : [t])
+    .find((t) => ENCODE_NAMES.has(t.type));
+  let src = enc && refsIn(enc) >= 0 ? inputOrigin(enc, refsIn(enc)) : null;
+  if (src?.type === BUILDER_NAME) src = refsIn(src) >= 0 ? inputOrigin(src, refsIn(src)) : null;
+  if (![LOADER_NAME, INPUT_LOADER_NAME].includes(src?.type)) return counts;
+  let items;
+  try { items = JSON.parse(src.widgets?.find((w) => w.name === "media_state")?.value || "[]"); } catch (e) { return counts; }
+  const { tags, extra } = computeTags(items);
+  for (const t of [...tags.values(), ...extra.values()]) {
+    const [, label, n] = t.match(/<(\w+) (\d+)>/);
+    const kind = label === "Picture" ? "image" : label.toLowerCase();
+    counts[kind] = Math.max(counts[kind], +n);
+  }
+  return counts;
+}
+
+/** Redraw the stacks whose labels moved because loader media or wiring changed. */
+export function refreshStackLabels() {
+  for (const p of StackPanel.all) {
+    if (p.root.isConnected && JSON.stringify(mediaBefore(p.node, p.chain())) !== p._mediaKey) p.render();
+  }
 }
 
 /* Presets: a saved stack. */
@@ -305,7 +387,8 @@ const CSS = `
 .mmr-slot.pic{border-color:#6d5527;} .mmr-slot.vid{border-color:#255c6b;} .mmr-slot.aud{border-color:#4c3d6e;}
 .mmr-slot.off{opacity:.45;}
 .mmr-slot.dragging{outline:1px dashed #6f86b8;background:#1b2230;}
-.mmr-slot.drop-before{box-shadow:-3px 0 0 #6f86b8;}
+.mmr-slot.dropinto{box-shadow:inset 0 0 0 2px #6f86b8;}
+.mmr-panel.mmr-dragging, .mmr-panel.mmr-dragging *{cursor:grabbing !important;user-select:none;}
 .mmr-slot.missing{border-color:#7a4a3a;}
 .mmr-slothead{display:flex;align-items:center;gap:5px;min-width:0;}
 .mmr-grip{border:0;background:none;color:#6b7484;cursor:grab;padding:0;font-size:calc(13px * var(--mmh3-fs, 1));
@@ -314,6 +397,10 @@ const CSS = `
   align-items:center;justify-content:center;font-family:ui-monospace,monospace;font-size:calc(8px * var(--mmh3-fs, 1));
   font-weight:600;color:#6b7484;overflow:hidden;}
 .mmr-slotname{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;line-height:1.2;}
+.mmr-slot .mmr-open{cursor:pointer;}
+.mmr-slot .mmr-open:hover .mmr-name{text-decoration:underline;}
+.mmr-sthumb.mmr-open:hover{outline:1px solid #5a6478;}
+.mmr-slot .mmr-open:focus-visible{outline:1px solid #6f86b8;outline-offset:1px;}
 .mmr-name{font-weight:600;font-size:calc(11.5px * var(--mmh3-fs, 1));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .mmr-path{font-family:ui-monospace,monospace;font-size:calc(8.5px * var(--mmh3-fs, 1));color:#6b7484;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
@@ -566,6 +653,8 @@ const CSS = `
 .mmr-src.off{opacity:.5;} .mmr-src>input{margin-top:5px;}
 .mmr-srcleft{display:flex;flex-direction:column;gap:5px;align-items:stretch;}
 .mmr-srcleft .mmr-kind{align-self:flex-start;padding:2px 8px;}
+.mmr-srckindrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.mmr-srcpos{font-family:ui-monospace,monospace;font-weight:600;font-size:calc(9.5px * var(--mmh3-fs, 1));color:#ffb84d;white-space:nowrap;}
 .mmr-sprev{position:relative;width:160px;height:100px;background:#101217;border-radius:6px;overflow:hidden;display:flex;
   flex-direction:column;align-items:center;justify-content:center;gap:4px;}
 .mmr-sprev img,.mmr-sprev video{width:100%;height:100%;object-fit:contain;display:block;}
@@ -633,12 +722,26 @@ function injectCSS() {
 
 /* ------------------------------------------------------ the panel */
 
+/** Give every pick a uid no other pick on the page has. Saved picks keep
+ *  theirs; one that has none, or repeats another's (a workflow edited by
+ *  hand, a pick pasted in), gets the next number. */
+function fixUids(picks) {
+  StackPanel.seq = Math.max(StackPanel.seq, ...picks.map((p) => +p.uid || 0));
+  const seen = new Set();
+  let changed = false;
+  for (const p of picks) {
+    if (!p || typeof p !== "object") continue;
+    if (p.uid == null || seen.has(p.uid)) { p.uid = ++StackPanel.seq; changed = true; }
+    seen.add(p.uid);
+  }
+  return changed;
+}
+
 class StackPanel {
   constructor(node) {
     this.node = node;
     this.state = readStack(node);
-    this.state.picks.forEach((p) => { if (p.uid == null) p.uid = ++StackPanel.seq; });
-    StackPanel.seq = Math.max(StackPanel.seq, ...this.state.picks.map((p) => +p.uid || 0));
+    const renumbered = fixUids(this.state.picks);
     injectCSS();
     this.root = el("div", { class: "mmr-panel" });
     this.dragUid = null;
@@ -663,8 +766,9 @@ class StackPanel {
       this.closePop(); this.closeScaleMenu(); this.closePresetMenu();
     };
     window.addEventListener("pointerdown", this._outside, true);
-    applyStackText(this, loadStackScale().text);
+    applyStackText(this, loadScale(STACK_SCALE_KEY, "node").text);
     StackPanel.all.add(this);
+    if (renumbered) this.write();
     this.render();
     this.refreshPresets();
   }
@@ -692,7 +796,7 @@ class StackPanel {
 
   reload() {
     this.state = readStack(this.node);
-    this.state.picks.forEach((p) => { if (p.uid == null) p.uid = ++StackPanel.seq; });
+    fixUids(this.state.picks);
     this.render();
   }
 
@@ -737,16 +841,16 @@ class StackPanel {
 
   chain() { return chainOf(this.node); }
 
-  /** Every entry Text Encode will see, numbered in send order: upstream
-   *  stacks first (from = their position in the chain), then this node's
-   *  own picks (from = 0). */
-  allGroups(chain = this.chain()) {
+  /** Every entry Text Encode will see, numbered in send order after the
+   *  loader media it labels first: upstream stacks (from = their position in
+   *  the chain), then this node's own picks (from = 0). */
+  allGroups(chain = this.chain(), start = mediaBefore(this.node, chain)) {
     const entries = [];
     chain.up.forEach((st, i) => {
       for (const e of deriveEntries(readStack(st).picks)) entries.push({ ...e, from: i + 1 });
     });
     for (const e of deriveEntries(this.state.picks)) entries.push({ ...e, from: 0 });
-    return labelGroups(entries);
+    return labelGroups(entries).map((g) => ({ ...g, nums: g.nums.map((n) => n + start[g.kind]) }));
   }
 
   groups() { return this.allGroups().filter((g) => g.from === 0); }
@@ -756,7 +860,9 @@ class StackPanel {
   render() {
     const { picks, budget } = this.state;
     const chain = this.chain();
-    const all = this.allGroups(chain);
+    const start = mediaBefore(this.node, chain);
+    this._mediaKey = JSON.stringify(start);
+    const all = this.allGroups(chain, start);
     const own = all.filter((g) => g.from === 0);
     const tokens = own.reduce((n, g) => n + g.strengths.length * g.tokens, 0);
     this.closePop();
@@ -834,18 +940,38 @@ class StackPanel {
     const files = [p.visual?.file, p.audio?.file].filter(Boolean).map((f) => f.split("/").pop()).join(" + ");
     const folder = (p.name || "").includes("/") ? p.name.slice(0, p.name.lastIndexOf("/")) + "/" : "";
     const thumb = p.preview
-      ? el("img", { class: "mmr-sthumb", src: previewURL(p.preview), alt: "" })
+      ? el("img", { class: "mmr-sthumb", src: previewURL(p.preview), alt: "", draggable: false })
       : el("div", { class: "mmr-sthumb" }, KIND[p.visual?.kind || "audio"]?.short || "REF");
     const kindCls = p.visual ? (KIND[p.visual.kind] || KIND.image).cls : "aud";
+    // Thumbnail and name are a way into the library: the same RefMod, open
+    // on its details pane.
+    const details = (e) => {
+      e.stopPropagation();
+      if (Date.now() - (this.dragEnded || 0) < 300) return;      // that click ended a drag
+      openLibrary(this, { select: p.name });
+    };
+    const opens = (node, title) => {
+      node.classList.add("mmr-open");
+      node.setAttribute("title", title);
+      node.setAttribute("role", "button");
+      node.tabIndex = 0;
+      node.addEventListener("click", details);
+      node.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); details(e); } });
+      return node;
+    };
+    const nameBlock = el("div", { class: "mmr-slotname" },
+      el("span", { class: "mmr-name" }, p.label || p.name),
+      el("span", { class: "mmr-path", title: `${folder}${files}` }, `${folder}${files}`));
+    const openTip = p.missing ? `Not found on disk: ${p.missing.join(", ")} — look for it in the library`
+      : `Open ${p.label || p.name} in the library`;
+    opens(thumb, openTip); opens(nameBlock, openTip);
     const card = el("div", { class: `mmr-slot ${kindCls}` + (p.on === false ? " off" : "") + (p.missing ? " missing" : ""),
       dataset: { uid: String(p.uid) }, title: p.missing ? `Not found on disk: ${p.missing.join(", ")}` : null },
       el("div", { class: "mmr-slothead" },
-        el("button", { class: "mmr-grip", draggable: true, title: "Drag to reorder (or arrow keys)",
+        el("button", { class: "mmr-grip", title: "Drag to reorder (or arrow keys)",
           onkeydown: (e) => this.keyMove(e, p) }, "⠇"),
         thumb,
-        el("div", { class: "mmr-slotname" },
-          el("span", { class: "mmr-name" }, p.label || p.name),
-          el("span", { class: "mmr-path", title: `${folder}${files}` }, `${folder}${files}`)),
+        nameBlock,
         el("label", { class: "mmr-sw", title: p.on === false ? "Off: sends nothing" : "On" },
           el("input", { type: "checkbox", checked: p.on !== false,
             onchange: (e) => { p.on = e.target.checked; this.write(); this.render(); } }),
@@ -860,27 +986,74 @@ class StackPanel {
           this.state.picks = this.state.picks.filter((x) => x !== p); this.write(); this.render();
         } }, "×")),
       chans);
-    card.addEventListener("dragstart", (e) => {
-      if (!e.target.closest(".mmr-grip")) { e.preventDefault(); return; }
-      this.dragUid = p.uid; card.classList.add("dragging");
-      try { e.dataTransfer.setData("text/plain", String(p.uid)); e.dataTransfer.effectAllowed = "move"; } catch (_) {}
-    });
-    card.addEventListener("dragover", (e) => {
-      if (this.dragUid == null || this.dragUid === p.uid) return;
-      e.preventDefault(); card.classList.add("drop-before");
-    });
-    card.addEventListener("dragleave", () => card.classList.remove("drop-before"));
-    card.addEventListener("drop", (e) => {
-      e.preventDefault();
-      if (this.dragUid == null || this.dragUid === p.uid) return;
-      const from = this.state.picks.findIndex((x) => x.uid === this.dragUid);
-      const moved = this.state.picks.splice(from, 1)[0];
-      const to = this.state.picks.findIndex((x) => x === p);
-      this.state.picks.splice(to, 0, moved);
-      this.dragUid = null; this.write(); this.render();
-    });
-    card.addEventListener("dragend", () => { this.dragUid = null; this.render(); });
+    this.reorderable(card, p);
     return card;
+  }
+
+  /** Reorder by pointer rather than by HTML5 drag: the panel lives in a
+   *  canvas widget, where a native drag starts but its drop never arrives,
+   *  and this works with a pen or a finger too. The handle, the thumbnail
+   *  and the name all grab the card; the drag only begins once the pointer
+   *  has moved a few pixels, so a plain click still opens the library.
+   *  Drop it on another card to take that place, or on an empty slot to go
+   *  last; Escape puts it back. */
+  reorderable(card, p) {
+    const grabbable = ".mmr-grip, .mmr-sthumb, .mmr-slotname";
+    card.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || !e.target.closest(grabbable)) return;
+      const x0 = e.clientX, y0 = e.clientY;
+      const grid = card.parentElement;
+      let live = false, over = null;
+      const clear = () => grid?.querySelectorAll(".mmr-slot.dropinto").forEach((c) => c.classList.remove("dropinto"));
+      const move = (ev) => {
+        if (!live) {
+          if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) < 5) return;
+          live = true;
+          card.classList.add("dragging");
+          this.root.classList.add("mmr-dragging");
+          card.setPointerCapture?.(e.pointerId);
+        }
+        ev.preventDefault();
+        // Walking off either end of a scrolling grid pulls it along.
+        if (grid) {
+          const r = grid.getBoundingClientRect();
+          if (ev.clientY < r.top + 24) grid.scrollTop -= 14;
+          else if (ev.clientY > r.bottom - 24) grid.scrollTop += 14;
+        }
+        clear();
+        const under = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".mmr-slot");
+        over = under && under !== card && grid?.contains(under) ? under : null;
+        if (over) over.classList.add("dropinto");
+      };
+      const finish = (drop) => {
+        window.removeEventListener("pointermove", move, true);
+        window.removeEventListener("pointerup", up, true);
+        window.removeEventListener("pointercancel", cancel, true);
+        window.removeEventListener("keydown", key, true);
+        if (!live) return;
+        card.classList.remove("dragging");
+        this.root.classList.remove("mmr-dragging");
+        clear();
+        this.dragEnded = Date.now();          // the click that follows isn't a click
+        const from = this.state.picks.indexOf(p);
+        let to = -1;
+        if (drop && over) to = over.classList.contains("empty")
+          ? this.state.picks.length - 1
+          : this.state.picks.findIndex((x) => String(x.uid) === over.dataset.uid);
+        if (drop && from >= 0 && to >= 0 && to !== from) {
+          this.state.picks.splice(to, 0, this.state.picks.splice(from, 1)[0]);
+          this.write();
+        }
+        this.render();
+      };
+      const up = () => finish(true);
+      const cancel = () => finish(false);
+      const key = (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); finish(false); } };
+      window.addEventListener("pointermove", move, true);
+      window.addEventListener("pointerup", up, true);
+      window.addEventListener("pointercancel", cancel, true);
+      window.addEventListener("keydown", key, true);
+    });
   }
 
   keyMove(e, p) {
@@ -1041,48 +1214,13 @@ class StackPanel {
   /* ---- node and text size, remembered per user like the Media Loader's */
 
   scaleControl() {
-    const prefs = this.scalePrefs || (this.scalePrefs = loadStackScale());
-    const pending = { node: prefs.node, text: prefs.text };
-    const inputs = {}, outs = {};
-    const dirty = () => applyBtn.classList.toggle("primary", pending.node !== prefs.node || pending.text !== prefs.text);
-    const maxFor = (key) => key === "text" ? TEXT_SCALE_MAX : SCALE_MAX;
-    const slider = (key, label) => {
-      const out = el("input", { type: "number", class: "mmr-scaleval",
-        min: String(Math.round(SCALE_MIN * 100)), max: String(Math.round(maxFor(key) * 100)), step: "5",
-        value: String(Math.round(pending[key] * 100)),
-        onchange: (e) => {
-          pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
-          const shown = Math.round(pending[key] * 100);
-          e.target.value = String(shown); input.value = String(shown); dirty();
-        },
-        onkeydown: (e) => { if (e.key === "Enter") e.target.blur(); } });
-      const input = el("input", { type: "range", class: "mmr-scalerange",
-        min: String(Math.round(SCALE_MIN * 100)), max: String(Math.round(maxFor(key) * 100)), step: "5",
-        value: String(Math.round(pending[key] * 100)),
-        oninput: (e) => {
-          pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
-          out.value = String(Math.round(pending[key] * 100)); dirty();
-        } });
-      inputs[key] = input; outs[key] = out;
-      return el("label", { class: "mmr-scalerow" }, el("span", { class: "mmr-scalelabel" }, label), input, out,
-        el("span", { class: "mmr-scalepct" }, "%"));
-    };
-    const commit = (n, t) => {
-      prefs.node = n; prefs.text = t; pending.node = n; pending.text = t;
-      inputs.node.value = outs.node.value = String(Math.round(n * 100));
-      inputs.text.value = outs.text.value = String(Math.round(t * 100));
-      saveStackScale(prefs);
-      applyStackText(this, t);
-      applyStackSize(this.node, n);        // last: this moves the popover
-      applyBtn.classList.remove("primary");
-    };
-    const applyBtn = el("button", { class: "mmr-btn mmr-sm", onclick: (e) => { e.stopPropagation(); commit(pending.node, pending.text); } }, "Apply");
-    const menu = el("div", { class: "mmr-scalemenu", onmousedown: (e) => e.stopPropagation() },
-      slider("node", "Node size"), slider("text", "Text size"),
-      el("div", { class: "mmr-scalefoot" },
-        el("span", {}, "Remembered for new nodes. Adding RefMods never resizes the node."),
-        el("button", { class: "mmr-btn mmr-sm", onclick: (e) => { e.stopPropagation(); commit(1, 1); } }, "Reset"),
-        applyBtn));
+    const prefs = this.scalePrefs || (this.scalePrefs = loadScale(STACK_SCALE_KEY, "node"));
+    const menu = sizeMenu(prefs, "node", "Node size", "Remembered for new nodes. Adding RefMods never resizes the node.",
+      (n, t) => {
+        saveScale(STACK_SCALE_KEY, prefs);
+        applyStackText(this, t);
+        applyStackSize(this.node, n);        // last: this moves the popover
+      });
     const btn = el("button", { class: "mmr-btn mmr-sm", title: "Node and text size",
       onclick: (e) => { e.stopPropagation(); const open = menu.classList.toggle("on"); btn.classList.toggle("on", open); } },
       "⤡ Size");
@@ -1326,6 +1464,7 @@ class StackPanel {
 }
 StackPanel.seq = 0;
 StackPanel.all = new Set();
+window.addEventListener("mml-media-changed", refreshStackLabels);
 
 /* ---------------------------------------------------------- library */
 
@@ -1339,10 +1478,13 @@ const cleanName = (t) => String(t || "").replace(NAME_BAD, "_").replace(/^[ ._]+
 // line (a break reads as a shot cut), no trailing full stop.
 const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().replace(/[\s.]+$/, "");
 const DESC_LIMIT = 300;
-const DESC_RULE = `Keep appearance and voice descriptions under ${DESC_LIMIT} characters.`;
+const DESC_RULE = `Keep appearance, voice and retained attributes under ${DESC_LIMIT} characters each.`;
 const APPEARANCE_TIP = "Optional. How the subject looks: Draft from RefMods writes it into their definition line. Saved inside the file.";
 const VOICE_TIP = "Optional. How the voice sounds: Draft from RefMods adds it to the voice line, and the speaker buttons use it. " +
   "Saved inside the file.";
+const RETAINED_TIP = "Optional. Specific small details the model should keep, like a tattoo or a scar: Draft from RefMods " +
+  "adds them to the end of the subject's retention note. Saved inside the file.";
+const RETAINED_HINT = "Specific small details that should be kept, such as tattoo descriptions, etc.";
 const stem = (f) => cleanName(String(f || "").split("/").pop().replace(/\.[^.]+$/, ""));
 
 const SETTING_RANGES = { ref_resolution: [256, 2048], grid: [2, 64], latent_frames: [1, 1024],
@@ -1355,7 +1497,7 @@ function clampSetting(key, value, fallback) {
   return Math.min(r[1], Math.max(r[0], v));
 }
 function loadSettings() {
-  const d = { mode: "Compressed Reference", ref_resolution: 1024, grid: 16, latent_frames: 22,
+  const d = { mode: "Compressed Reference", ref_resolution: 768, grid: 16, latent_frames: 22,
     refinement_steps: 500, max_tokens: 5120, audio_max_seconds: 30, concept_type: "generic",
     subfolder: "", write_preview: true, videoVae: "", audioVae: "", combine: true };
   let st = d;
@@ -1445,7 +1587,7 @@ function compressedTokens(w, h, res, grid) {
 /* ---- stack fit preview --------------------------------------------------
  * In a stack every frame takes the first source's shape. Full cover-crops
  * the others to it (edges cut off); Compressed pools them to the same grid
- * (squeezed, nothing cut). These draw exactly that, from the picture the
+ * (edges trimmed to the first photo's shape). These draw exactly that, from the picture the
  * encoder will get: the loader's turn, mirror and crop applied first. */
 
 const frameCache = new Map();
@@ -1494,27 +1636,23 @@ function effectiveCanvas(src, rec, cap = 480) {
 }
 
 /** How a source fits the stack's frame: what share is cut (Full) or how
- *  much it is squeezed (Compressed), along which axis. */
+ *  along which axis. Both modes trim. */
 function fitOf(aspect, target) {
   if (!target) return null;
   const A = target.aspect;
-  if (target.mode === "full") {
-    return aspect > A ? { kind: "trim", axis: "width", keep: A / aspect }
-                      : { kind: "trim", axis: "height", keep: aspect / A };
-  }
-  return aspect > A ? { kind: "squeeze", axis: "width", keep: A / aspect }
-                    : { kind: "squeeze", axis: "height", keep: aspect / A };
+  // Both modes trim: the photo is scaled to cover the first one's frame and
+  // the overhang is cut off. Nothing is squeezed any more.
+  return aspect > A ? { kind: "trim", axis: "width", keep: A / aspect }
+                    : { kind: "trim", axis: "height", keep: aspect / A };
 }
 function fitCaption(fit) {
   if (!fit || fit.keep > 0.97) return "Fits the frame";
-  const pct = Math.round((1 - fit.keep) * 100);
-  return fit.kind === "trim" ? `Edges trimmed: ${pct}% of the ${fit.axis}`
-                             : `Squeezed: ${Math.round(fit.keep * 100)}% of its ${fit.axis}`;
+  return `Edges trimmed: ${Math.round((1 - fit.keep) * 100)}% of the ${fit.axis}`;
 }
 
 /** Draw a source onto a canvas of any size. With a stack target the
- *  picture is shown as the stack will use it (Full: trimmed parts shaded;
- *  Compressed: squeezed); without one, or for the first photo, it is shown
+ *  picture is shown as the stack will use it (trimmed parts shaded);
+ *  without one, or for the first photo, it is shown
  *  whole. Always the encoder's view: turn, mirror and crop applied. */
 function drawFit(cv, rec, target, isFirst) {
   return loadDrawable(rec).then((src) => {
@@ -1534,20 +1672,14 @@ function drawFit(cv, rec, target, isFirst) {
       return;
     }
     const fit = fitOf(aspect, target);
-    if (target.mode === "full") {
-      const [x, y, w, h] = fitBox(aspect);
-      g.drawImage(img, x, y, w, h);
-      const kw = fit.axis === "width" ? w * fit.keep : w, kh = fit.axis === "height" ? h * fit.keep : h;
-      const kx = x + (w - kw) / 2, ky = y + (h - kh) / 2;
-      g.fillStyle = "rgba(8,10,14,.72)";
-      if (fit.axis === "width") { g.fillRect(x, y, kx - x, h); g.fillRect(kx + kw, y, x + w - (kx + kw), h); }
-      else { g.fillRect(x, y, w, ky - y); g.fillRect(x, ky + kh, w, y + h - (ky + kh)); }
-      outline(kx, ky, kw, kh);
-    } else {
-      const [x, y, w, h] = fitBox(target.aspect);
-      g.drawImage(img, x, y, w, h);
-      outline(x, y, w, h);
-    }
+    const [x, y, w, h] = fitBox(aspect);
+    g.drawImage(img, x, y, w, h);
+    const kw = fit.axis === "width" ? w * fit.keep : w, kh = fit.axis === "height" ? h * fit.keep : h;
+    const kx = x + (w - kw) / 2, ky = y + (h - kh) / 2;
+    g.fillStyle = "rgba(8,10,14,.72)";
+    if (fit.axis === "width") { g.fillRect(x, y, kx - x, h); g.fillRect(kx + kw, y, x + w - (kx + kw), h); }
+    else { g.fillRect(x, y, w, ky - y); g.fillRect(x, ky + kh, w, y + h - (ky + kh)); }
+    outline(kx, ky, kw, kh);
   }).catch(() => {
     const g = cv.getContext("2d"); g.fillStyle = "#6b7484"; g.font = `${Math.round(cv.width / 14)}px ui-monospace,monospace`;
     g.textAlign = "center"; g.fillText("no preview", cv.width / 2, cv.height / 2);
@@ -1633,16 +1765,28 @@ function sourcePreview(rec, caption) {
   return box;
 }
 
+/** Unfinished Create-tab work, held while the library is closed so that
+ *  opening it again — Browse library…, Create…, an empty slot, a loader's
+ *  menu — lands back where you left off. In memory for the session only:
+ *  a page reload starts clean. */
+let libDraft = null;
+
 /**
  * The RefMod library: curate what is on disk, create new ones.
  * `panel` is the stack panel that opened it (null when opened from a loader
  * or the canvas); `opts.sources` seeds the Create tab, `opts.tab` picks the
- * tab to open on.
+ * tab to open on, `opts.select` opens the library on one RefMod's details.
  */
 export function openLibrary(panel, opts = {}) {
   injectCSS();
   let items = [], roots = [], packInstalled = true;
-  const view = { folder: "all", kind: "all", q: "", sort: "name", tab: opts.tab || "library", selected: null };
+  const resume = libDraft;       // work in progress from a library that was closed
+  libDraft = null;
+  // Asking for a RefMod's details opens the library; otherwise the caller's
+  // own tab wins (Create…, a loader sending media), and an unfinished draft
+  // brings you back to the tab you were on.
+  const view = { folder: "all", kind: "all", q: "", sort: "name",
+    tab: opts.select ? "library" : (opts.tab || resume?.tab || "library"), selected: null };
   const st = loadSettings();
   const sources = sourcesFromItems(opts.sources || [], opts.origin || "Media Loader");
   const highlight = new Set();
@@ -1654,7 +1798,7 @@ export function openLibrary(panel, opts = {}) {
     onclick: () => { view.tab = id; paintTabs(); } }, label);
   const tabs = el("div", { class: "mmr-tabs" });
   const summary = el("small", {}, "Loading…");
-  const close = () => { window.removeEventListener("keydown", onKey); unhook(); hidePeek(); overlay.remove(); };
+  const close = () => { window.removeEventListener("keydown", onKey); unhook(); hidePeek(); overlay.remove(); keepDraft(); gone = true; };
   const onKey = (e) => {
     if (e.key !== "Escape" || document.querySelector(".mml-tmover")) return;   // the crop editor handles its own
     e.stopPropagation(); close();
@@ -1662,19 +1806,32 @@ export function openLibrary(panel, opts = {}) {
   window.addEventListener("keydown", onKey);
   const libraryPane = el("div", { class: "mmr-pane" });
   const createPane = el("div", { class: "mmr-pane" });
-  const overlay = el("div", { class: "mmr-overlay", onmousedown: (e) => { if (e.target === overlay) close(); } },
-    el("div", { class: "mmr-modal", role: "dialog", "aria-label": "RefMod library" },
-      el("div", { class: "mmr-head" }, el("strong", {}, "RefMod library"), summary, tabs, el("span", { class: "mmr-grow" }),
-        el("button", { class: "mmr-btn", onclick: () => load(true) }, "Refresh"),
-        el("button", { class: "mmr-btn", onclick: close }, "Close")),
-      libraryPane, createPane));
+  // The library's own window and text size; its text size wins over the Prompt Builder's inside it.
+  const scale = loadScale(LIBRARY_SCALE_KEY, "window");
+  const scaleMenu = sizeMenu(scale, "window", "Window size", "Remembered for the library",
+    () => { saveScale(LIBRARY_SCALE_KEY, scale); applyScale(); });
+  const scaleBtn = el("button", { class: "mmr-btn", title: "Window and text size",
+    onclick: (e) => { e.stopPropagation(); scaleBtn.classList.toggle("on", scaleMenu.classList.toggle("on")); } }, "⤡ Size");
+  const modal = el("div", { class: "mmr-modal", role: "dialog", "aria-label": "RefMod library",
+      onmousedown: (e) => { if (!e.target.closest(".mmr-scalewrap")) { scaleMenu.classList.remove("on"); scaleBtn.classList.remove("on"); } } },
+    el("div", { class: "mmr-head" }, el("strong", {}, "RefMod library"), summary, tabs, el("span", { class: "mmr-grow" }),
+      el("span", { class: "mmr-scalewrap" }, scaleBtn, scaleMenu),
+      el("button", { class: "mmr-btn", onclick: () => load(true) }, "Refresh"),
+      el("button", { class: "mmr-btn", onclick: close }, "Close")),
+    libraryPane, createPane);
+  const applyScale = () => {
+    modal.style.width = `min(${Math.round(1100 * scale.window)}px, 95vw)`;
+    modal.style.height = `min(${Math.round(760 * scale.window)}px, 92vh)`;
+    modal.style.setProperty("--mmh3-fs", String(scale.text));
+  };
+  applyScale();
+  const overlay = el("div", { class: "mmr-overlay", onmousedown: (e) => { if (e.target === overlay) close(); } }, modal);
   document.body.append(overlay);
   overlay.addEventListener("scroll", hidePeek, true);
 
   // Files dropped anywhere on the dialog, or on the dimmed page around it,
   // go to the Create tab. Taking the event here also stops the browser from
   // opening the file and ComfyUI from reading a PNG as a workflow.
-  const modal = overlay.firstChild;
   const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
   let dragDepth = 0;
   const setDropping = (on) => modal.classList.toggle("dropping", on);
@@ -1726,7 +1883,10 @@ export function openLibrary(panel, opts = {}) {
   const grid = el("div", { class: "mmr-grid" }, el("div", { class: "mmr-status" }, "Scanning RefMod folders…"));
   const inspector = el("aside", { class: "mmr-inspector", hidden: true });
   const body = el("div", { class: "mmr-body" }, folders, grid, inspector);
-  setChildren(libraryPane, el("div", { class: "mmr-bar" }, search, seg, sort), body);
+  const framesBtn = el("button", { class: "mmr-btn", hidden: true, onclick: async () => {
+    framesBtn.disabled = true; await storeFrames(items.filter(needsFrames)); paintFramesBtn();
+  } });
+  setChildren(libraryPane, el("div", { class: "mmr-bar" }, search, seg, sort, framesBtn), body);
 
   const kindsOf = (it) => [it.visual?.kind, it.audio && "audio"].filter(Boolean);
   const tokensOf = (it) => (it.visual?.tokens || 0) + (it.audio?.tokens || 0);
@@ -1752,7 +1912,7 @@ export function openLibrary(panel, opts = {}) {
     const q = view.q.trim().toLowerCase();
     let list = items.filter((it) => (view.folder === "all" || it.folder === view.folder)
       && (view.kind === "all" || kindsOf(it).includes(view.kind))
-      && (!q || [it.label, it.name, it.folder, it.desc, it.subject_name, it.appearance, it.voice_description, filesShort(it)].join(" ").toLowerCase().includes(q)));
+      && (!q || [it.label, it.name, it.folder, it.desc, it.subject_name, it.appearance, it.voice_description, it.retained_attributes, filesShort(it)].join(" ").toLowerCase().includes(q)));
     list.sort((a, b) => view.sort === "tokens" ? tokensOf(a) - tokensOf(b)
       : view.sort === "folder" ? (a.folder + a.label).localeCompare(b.folder + b.label)
       : view.sort === "new" ? (b.mtime || 0) - (a.mtime || 0) : a.label.localeCompare(b.label));
@@ -1775,7 +1935,7 @@ export function openLibrary(panel, opts = {}) {
     if (it.paired) b.push(el("span", { class: "mmr-b pair" }, "pair"));
     if (it.subject_name) b.push(el("span", { class: "mmr-b", title: "Subject name used in prompts" }, `name \u00b7 ${it.subject_name}`));
     if (it.bundle) b.push(el("span", { class: "mmr-b pair", title: "A single-file bundle made by ComfyUI-MiniMaxH3Mod. " +
-      "Its first look and first voice are used here; it can be inspected but not edited in this library." },
+      "Its first look and first voice are used here. Editing it saves a copy; the bundle itself isn't changed." },
       `bundle · ${it.bundle} member${it.bundle === 1 ? "" : "s"}`));
     if (it.visual) b.push(el("span", { class: "mmr-b",
       title: it.visual.mode === "encode"
@@ -1792,7 +1952,7 @@ export function openLibrary(panel, opts = {}) {
       title: inStack ? "Already in the stack — adds another copy" : "Add to the stack" },
       inStack ? "✓ Add again" : "Add"));
     return el("article", { class: "mmr-card" + (inStack ? " instack" : "") + (view.selected === it.name ? " selected" : "") + (highlight.has(it.name) ? " new" : ""),
-      onclick: () => select(it.name) },
+      dataset: { name: it.name }, onclick: () => select(it.name) },
       el("div", { class: "mmr-cthumb" }, thumb),
       el("div", { class: "mmr-cbody" },
         el("div", { class: "mmr-cname" }, el("span", { title: it.name }, it.label), el("span", { class: "mmr-cfolder" }, it.folder)),
@@ -1810,6 +1970,19 @@ export function openLibrary(panel, opts = {}) {
     if (view.selected) paintInspector();
   }
 
+  /** Show one RefMod's details and scroll its card into view — a click on a
+   *  stack card's thumbnail or name. Folder and search are cleared so the
+   *  card is on the grid whatever the library was last filtered to. */
+  function reveal(name) {
+    if (!byName(name)) { toast(`${name.split("/").pop()} isn't in the library any more.`, 5000); return; }
+    if (view.folder !== "all") { view.folder = "all"; drawFolders(); }
+    if (view.q) { view.q = ""; search.value = ""; }
+    if (view.kind !== "all") { view.kind = "all"; seg.querySelectorAll("button").forEach((b, i) => b.classList.toggle("on", i === 0)); }
+    if (view.selected !== name) select(name); else drawGrid();
+    const card = [...grid.children].find((c) => c.dataset?.name === name);
+    card?.scrollIntoView({ block: "center" });
+  }
+
   /* ---- inspector: rename / move / describe / preview / delete */
   function paintInspector() {
     const it = byName(view.selected);
@@ -1820,6 +1993,8 @@ export function openLibrary(panel, opts = {}) {
         "and !Name stands for it. The RefMod's own name and description stay yours and never go into a prompt." });
     const appIn = el("input", { class: "mmr-search", value: it.appearance || "", placeholder: "auburn hair, a freckled face and a green coat",
       "aria-label": "Appearance", title: APPEARANCE_TIP });
+    const keepIn = it.visual ? el("input", { class: "mmr-search", value: it.retained_attributes || "", placeholder: RETAINED_HINT,
+      "aria-label": "Retained attributes", title: RETAINED_TIP }) : null;
     const voiceIn = it.audio ? el("input", { class: "mmr-search", value: it.voice_description || "",
       placeholder: "low, husky voice with a slow, warm pace", "aria-label": "Voice", title: VOICE_TIP }) : null;
     const folderIn = el("input", { class: "mmr-search", value: it.folder, placeholder: "(root)", "aria-label": "Folder" });
@@ -1864,12 +2039,13 @@ export function openLibrary(panel, opts = {}) {
         const subj = subjIn.value.trim();
         if (subj && !/^[A-Za-z][\w-]{0,39}$/.test(subj)) { say("A subject name is one word: letters, digits, - and _, starting with a letter.", true); return; }
         const app = oneLine(appIn.value), voi = voiceIn ? oneLine(voiceIn.value) : (it.voice_description || "");
-        if (app.length > DESC_LIMIT || voi.length > DESC_LIMIT) { say(DESC_RULE, true); return; }
+        const kept = keepIn ? oneLine(keepIn.value) : (it.retained_attributes || "");
+        if (app.length > DESC_LIMIT || voi.length > DESC_LIMIT || kept.length > DESC_LIMIT) { say(DESC_RULE, true); return; }
         if ((descIn.value || "") !== (it.desc || "") || conceptIn.value !== it.concept || subj !== (it.subject_name || "")
-            || app !== (it.appearance || "") || voi !== (it.voice_description || "")) {
+            || app !== (it.appearance || "") || voi !== (it.voice_description || "") || kept !== (it.retained_attributes || "")) {
           const r = await postApi("/minimax_h3/refmods/meta", { headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ files: files(it), description: descIn.value, concept_type: conceptIn.value, subject_name: subj,
-              appearance: app, voice_description: voi }) });
+              appearance: app, voice_description: voi, retained_attributes: kept }) });
           const d = await r.json(); if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
         }
         if (target !== it.name) {
@@ -1909,6 +2085,8 @@ export function openLibrary(panel, opts = {}) {
         el("span", { class: "mmr-dim mmr-numhint" }, "Used in prompts \u2014 optional, one word")),
       el("label", { class: "mmr-ilabel", title: APPEARANCE_TIP }, "Appearance", appIn,
         el("span", { class: "mmr-dim mmr-numhint" }, "Drafted into the subject's line \u2014 optional")),
+      keepIn ? el("label", { class: "mmr-ilabel", title: RETAINED_TIP }, "Retained attributes", keepIn,
+        el("span", { class: "mmr-dim mmr-numhint" }, "Drafted into retention_analysis \u2014 optional")) : null,
       voiceIn ? el("label", { class: "mmr-ilabel", title: VOICE_TIP }, "Voice", voiceIn,
         el("span", { class: "mmr-dim mmr-numhint" }, "Drafted onto the voice line \u2014 optional")) : null,
       el("div", { class: "mmr-idetails" }, chanRow("Look", it.visual), chanRow("Voice", it.audio),
@@ -1959,11 +2137,60 @@ export function openLibrary(panel, opts = {}) {
         "Strength", slider, sval),
       btn, box,
       it.bundle
-        ? el("div", { class: "mmr-dim mmr-isub" }, "A single-file bundle from ComfyUI-MiniMaxH3Mod: usable and inspectable here, " +
-            "but edit it with that pack (or save its members as standalone files there first).")
-        : el("div", { class: "mmr-iactions" },
-            el("button", { class: "mmr-btn primary", title: "Drop, reorder or add frames and change the voice on the Create tab",
-              onclick: () => startEdit(it) }, "Edit frames & voice…")));
+        ? el("div", { class: "mmr-dim mmr-isub" }, "A single-file bundle from ComfyUI-MiniMaxH3Mod. Editing it saves a copy " +
+            "as standalone files; the bundle itself isn't changed.")
+        : null,
+      el("div", { class: "mmr-iactions" },
+        el("button", { class: "mmr-btn primary", title: "Drop, reorder or add frames and change the voice on the Create tab",
+          onclick: () => startEdit(it) }, "Edit frames & voice…"),
+        needsFrames(it) ? el("button", { class: "mmr-btn", disabled: framesPending(it.name), title: FRAMES_TIP,
+          onclick: async (e) => {
+            const b = e.currentTarget; b.disabled = true;
+            if (await storeFrames([it])) b.textContent = "Storing encoder frames…"; else b.disabled = false;
+          } },
+          framesPending(it.name) ? "Storing encoder frames…" : "Store encoder frames") : null));
+  }
+
+  /* ---- encoder frames: RefMods saved before they carried the frames the
+   *      text encoder is shown get them added, one decode each */
+  const FRAMES_NAME = "MiniMaxH3FantasticRefModStoreFrames";
+  const FRAMES_TIP = "Saved without the frames H3's text encoder is shown, so the RefMod Text Encode decodes it " +
+    "(once, then keeps them in the cache). Storing them in the file decodes it once, through the queue with the H3 video VAE.";
+  const needsFrames = (it) => !it.bundle && !!it.visual && !it.visual.frames;
+  const framesJob = () => jobs.find((j) => j.frames && j.status !== "done" && j.status !== "error");
+  const framesPending = (name) => jobs.some((j) => j.frames?.includes(name) && j.status !== "done" && j.status !== "error");
+  function paintFramesBtn() {
+    const j = framesJob(), n = items.filter(needsFrames).length;
+    framesBtn.hidden = !j && !n;
+    framesBtn.disabled = !!j;
+    framesBtn.textContent = !j ? `Store encoder frames (${n})`
+      : j.status === "running" ? `Storing encoder frames… ${Math.round(j.progress * 100)}%` : "Storing encoder frames (queued)";
+    framesBtn.title = `${n} RefMod${n === 1 ? " was" : "s were"} saved without the frames H3's text encoder is shown, so the ` +
+      "RefMod Text Encode decodes them. This stores them in each file: one decode each, through the queue with the H3 video VAE.";
+  }
+  async function storeFrames(list) {
+    const vae = guessVae("videoVae", /minimax.*video|h3.*video/i);
+    if (!vae) { toast("Choose the H3 video VAE on the Create tab first", 4000); return false; }
+    const prompt = { 1: { class_type: "VAELoader", inputs: { vae_name: vae } },
+      2: { class_type: FRAMES_NAME, inputs: { files: list.map((it) => it.visual.file).join("\n"), vae: ["1", 0] } } };
+    try {
+      const r = await api.fetchApi("/prompt", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, client_id: api.clientId }) });
+      const d = await r.json();
+      if (!r.ok || d.error) {
+        const errs = Object.values(d.node_errors || {}).flatMap((n) => (n.errors || []).map((e) => e.message || e.details || ""));
+        throw new Error((d.error && (d.error.message || d.error)) + (errs.length ? ": " + errs.join("; ") : ""));
+      }
+      const what = list.length === 1 ? list[0].label : `${list.length} RefMods`;
+      jobs.unshift({ prompt_id: d.prompt_id, names: [`Encoder frames for ${what}`], status: "queued", msg: `#${d.number} in the queue`,
+        progress: 0, saved: [], frames: list.map((it) => it.name) });
+      hook(); watchJob(d.prompt_id); paintJobs();
+      toast(`Queued encoder frames for ${what}`);
+      return true;
+    } catch (err) {
+      toast(`Couldn't queue: ${err.message}`, 6000);
+      return false;
+    }
   }
 
   /** Decode a RefMod through the queue. `opts.forEdit` asks for full-strength
@@ -2036,7 +2263,10 @@ export function openLibrary(panel, opts = {}) {
    *  Covers decode jobs and the Create tab's create/edit jobs alike. */
   function watchJob(pid) {
     const started = Date.now();
-    const pending = () => inspectJobs.has(pid) || jobs.some((j) => j.prompt_id === pid && j.status !== "done" && j.status !== "error");
+    // A closed dialog stops polling: whatever it was watching goes into the
+    // draft, and the library that picks the draft up watches it instead.
+    const pending = () => !gone && (inspectJobs.has(pid)
+      || jobs.some((j) => j.prompt_id === pid && j.status !== "done" && j.status !== "error"));
     const tick = async () => {
       if (!pending() || Date.now() - started > 30 * 60 * 1000) return;
       try {
@@ -2122,8 +2352,8 @@ export function openLibrary(panel, opts = {}) {
     if (!it.visual && !it.audio) return;
     if (editing) cancelEdit(false);
     editing = { name: it.name, it, visual: it.visual, audio: it.audio, decoded: false, decodeError: "", subject: it.subject_name || "",
-      appearance: it.appearance || "", voiceDesc: it.voice_description || "",
-      copy: false, copyName: `${it.label} copy` };
+      appearance: it.appearance || "", voiceDesc: it.voice_description || "", retained: it.retained_attributes || "",
+      copy: !!it.bundle, copyName: `${it.label} copy` };      // a bundle is only ever saved as a copy
     // The file's own shape, in pixels: what new pictures are fitted to.
     let w = (it.visual?.w || 0) * 16, h = (it.visual?.h || 0) * 16;
     const first = String(it.visual?.source_shape || "").split("+")[0].trim().split("x");
@@ -2144,6 +2374,7 @@ export function openLibrary(panel, opts = {}) {
     if (last && last.strength >= 1 && last.view === "frames" && (last.images || []).length === (it.visual?.t || 0)
         && (!it.audio || (last.audio || []).length)) seedStored(last);
     else queueInspect(it, { forEdit: true });
+    resumed = false;               // a fresh edit, not something carried over
     view.tab = "create"; paintTabs();
   }
   function seedStored(job) {
@@ -2184,10 +2415,13 @@ export function openLibrary(panel, opts = {}) {
     const appearance = oneLine(editing.appearance), voiceDesc = oneLine(editing.voiceDesc);
     const appearanceChanged = appearance !== (editing.it.appearance || "");
     const voiceDescChanged = voiceDesc !== (editing.it.voice_description || "");
-    const descBad = appearance.length > DESC_LIMIT || voiceDesc.length > DESC_LIMIT;
+    const retained = oneLine(editing.retained);
+    const retainedChanged = retained !== (editing.it.retained_attributes || "");
+    const descBad = appearance.length > DESC_LIMIT || voiceDesc.length > DESC_LIMIT || retained.length > DESC_LIMIT;
     return { order, adds, same, voice, newVoice, looks: looks.length,
-      changed: !same || !!voice || nameChanged || appearanceChanged || voiceDescChanged,
-      subject, nameChanged, nameBad, appearance, appearanceChanged, voiceDesc, voiceDescChanged, descBad };
+      changed: !same || !!voice || nameChanged || appearanceChanged || voiceDescChanged || retainedChanged,
+      subject, nameChanged, nameBad, appearance, appearanceChanged, voiceDesc, voiceDescChanged,
+      retained, retainedChanged, descBad };
   }
 
   /* ---- create tab */
@@ -2217,7 +2451,43 @@ export function openLibrary(panel, opts = {}) {
   // for turning a batch of unrelated items into separate references.
   let combine = st.combine !== false;
   let stackName = "";
-  let subjectName = "", appearanceText = "", voiceText = "";
+  let subjectName = "", appearanceText = "", voiceText = "", retainedText = "";
+  let resumed = false;           // this tab was picked back up from a draft
+
+  /* ---- unfinished work survives the dialog being closed: the Close button,
+   *      Escape, or a click on the dimmed page around it. Everything lives in
+   *      this closure, so the draft holds the live objects and reopening the
+   *      library hands them to the new one. */
+  function keepDraft() {
+    const busy = jobs.some((j) => j.status !== "done" && j.status !== "error");
+    if (!editing && !sources.length && !stackName && !subjectName && !appearanceText && !voiceText && !retainedText && !busy) return;
+    libDraft = { sources: [...sources], editing, combine, stackName, subjectName,
+      appearance: appearanceText, voice: voiceText, retained: retainedText, jobs: [...jobs], decodes: [...inspectJobs], tab: view.tab };
+  }
+  /** Take a draft back up. Sources the caller sent again (a loader's "send
+   *  media" for files already on the list) keep their place in the draft. */
+  function resumeDraft(d) {
+    const had = new Set(d.sources.map((x) => x.rec.file).filter(Boolean));
+    for (let i = sources.length - 1; i >= 0; i--) if (had.has(sources[i].rec.file)) sources.splice(i, 1);
+    sources.unshift(...d.sources);
+    editing = d.editing; combine = d.combine; stackName = d.stackName;
+    subjectName = d.subjectName; appearanceText = d.appearance; voiceText = d.voice; retainedText = d.retained || "";
+    jobs.push(...d.jobs);
+    for (const [pid, job] of d.decodes) inspectJobs.set(pid, job);
+    // Queue runs carry on while the library is shut; listen again and let the
+    // history poll fill in anything that finished in the meantime.
+    const live = [...d.jobs.filter((j) => j.status !== "done" && j.status !== "error").map((j) => j.prompt_id),
+      ...d.decodes.map(([pid]) => pid)];
+    if (live.length) { hook(); live.forEach(watchJob); }
+    resumed = !!editing || sources.length > 0 || !!stackName || !!subjectName || !!appearanceText || !!voiceText || !!retainedText;
+  }
+  /** Empty the Create tab: the "Start fresh" button on a resumed draft. */
+  function clearDraft() {
+    sources.splice(0, sources.length);
+    stackName = subjectName = appearanceText = voiceText = retainedText = "";
+    resumed = false;
+    paintCreate();
+  }
   const isLook = (s) => s.rec.kind === "picture" || s.rec.kind === "video";
   const used = () => sources.filter((x) => x.use);
   const defaultStackName = () => {
@@ -2394,7 +2664,7 @@ export function openLibrary(panel, opts = {}) {
       const plan = editPlan(), e = estimate(u), t = editing.visual?.t || 0;
       const voiceNote = (plan.voice === "new" ? " · new voice" : plan.voice === "remove" ? " · voice removed" : "") +
         (plan.nameChanged ? (plan.subject ? ` · named ${plan.subject}` : " · subject name cleared") : "") +
-        (plan.appearanceChanged || plan.voiceDescChanged ? " · descriptions updated" : "");
+        (plan.appearanceChanged || plan.voiceDescChanged || plan.retainedChanged ? " · descriptions updated" : "");
       const copyTo = editing.copy ? copyTarget() : null;
       if (editing.decodeError) { cls = "over"; line = `Couldn't decode the stored frames: ${editing.decodeError}`; }
       else if (plan.nameBad) { blocked = true; cls = "over"; line = SUBJECT_RULE; }
@@ -2404,7 +2674,8 @@ export function openLibrary(panel, opts = {}) {
       else if (!plan.changed && !editing.copy) line = `${t} frame${t === 1 ? "" : "s"} · ${fmt(editing.visual?.tokens || 0)} tokens · nothing changed yet`;
       else if (editing.visual && !plan.looks) { blocked = true; cls = "over"; line = "That would leave no frames — delete the RefMod instead."; }
       else if (!e.known) line = `${t} → ${e.frames}+ frames${voiceNote} · working out the size…`;
-      else if (st.max_tokens > 0 && e.tokens > st.max_tokens) {
+      // Only growth is held to the limit: dropping frames from a big file must still save.
+      else if (st.max_tokens > 0 && e.tokens > st.max_tokens && e.tokens > (editing.visual?.tokens || 0)) {
         blocked = true; cls = "over";
         line = `About ${fmt(e.tokens)} tokens — over the ${fmt(st.max_tokens)} limit. Raise the limit or untick some frames.`;
       } else line = `${t} → ${e.frames} frame${e.frames === 1 ? "" : "s"}${voiceNote} · about ${fmt(e.tokens)} tokens (${limitText()})` +
@@ -2482,8 +2753,10 @@ export function openLibrary(panel, opts = {}) {
           el("span", { class: "mmr-grow" }),
           el("button", { class: "mmr-btn", onclick: () => cancelEdit() }, "Cancel")),
         el("div", { class: "mmr-cbar" },
-          el("label", { class: "mmr-inline", title: "Leave the original as it is and write the result as a new RefMod" },
-            el("input", { type: "checkbox", checked: editing.copy,
+          el("label", { class: "mmr-inline", title: editing.it.bundle
+              ? "A bundle from ComfyUI-MiniMaxH3Mod is always saved as a copy: new standalone files, with the bundle left as it is"
+              : "Leave the original as it is and write the result as a new RefMod" },
+            el("input", { type: "checkbox", checked: editing.copy, disabled: !!editing.it.bundle,
               onchange: (e) => { editing.copy = e.target.checked; paintCreate(); } }), "Save as a copy"),
           editing.copy ? el("input", { class: "mmr-search", value: editing.copyName, "aria-label": "Name for the copy",
             placeholder: "name for the copy", style: { flex: "1 1 160px" },
@@ -2492,9 +2765,10 @@ export function openLibrary(panel, opts = {}) {
         el("div", { class: "mmr-srchint" },
           "The stored frames are listed first. Untick or remove the ones you don't want, drag to reorder, and drop new " +
           "pictures or clips in to add them — they're encoded to this file's size and shape (" +
-          (fullMode() ? "edges trimmed" : "squeezed") + " to fit). Frames you keep are copied as they are, never re-encoded." +
+          "edges trimmed to fit). Frames you keep are copied as they are, never re-encoded." +
           (editing.audio ? " Adding an audio file, or ticking a clip's soundtrack, replaces the voice; untick the stored voice to remove it."
                          : " Add an audio file, or tick a clip's soundtrack, to give it a voice.")),
+        resumed ? el("div", { class: "mmr-srchint" }, "Picked up where you left off when the library was closed.") : null,
         editing.clipRuns.length
           ? el("div", { class: "mmr-srchint" + (clipBroken() ? " warn" : "") },
               clipBroken()
@@ -2515,6 +2789,9 @@ export function openLibrary(panel, opts = {}) {
       el("button", { class: combine ? "" : "on", onclick: () => { combine = false; st.combine = false; saveSettings(st); paintCreate(); } },
         "One per source"));
     const kids = [seg];
+    if (resumed) kids.push(el("div", { class: "mmr-srchint" },
+      "Picked up where you left off when the library was closed. ",
+      el("button", { class: "mmr-btn mmr-sm", onclick: () => clearDraft() }, "Start fresh")));
     if (combine) {
       kids.push(el("label", { class: "mmr-ilabel" }, "Name",
         el("input", { class: "mmr-search", value: stackName || defaultStackName(), "aria-label": "RefMod name",
@@ -2523,7 +2800,7 @@ export function openLibrary(panel, opts = {}) {
         const full = st.mode === "Full Reference";
         kids.push(el("div", { class: "mmr-srchint" },
           `The ${looks} pictures and clips become one reference, one frame each. They all take the first one's ` +
-          `shape, and the others ${full ? "have their edges trimmed" : "are squeezed"} to fit, so put your ` +
+          `shape, and the others have their edges trimmed to fit, so put your ` +
           "best-framed photo first. Drag to reorder. In prompts it's cited as one video, like <Video 1>."));
         const t = stackTarget();
         if (t) {
@@ -2531,7 +2808,7 @@ export function openLibrary(panel, opts = {}) {
             .filter((x) => { const [w, h] = effDims(x); return fitOf(w / h, t).keep < 0.8; }).length;
           if (bad) kids.push(el("div", { class: "mmr-srchint warn" },
             `${bad === 1 ? "1 photo is" : `${bad} photos are`} a very different shape from the first and will be ` +
-            `${full ? "trimmed" : "squeezed"} noticeably — see the previews.`));
+            `trimmed noticeably — see the previews.`));
         }
       }
     }
@@ -2565,8 +2842,9 @@ export function openLibrary(panel, opts = {}) {
         el("select", { class: "mmr-sel", onchange: (e) => { st[key] = e.target.value; saveSettings(st); } },
           el("option", { value: "" }, "(choose)"), vaes.map((v) => el("option", { value: v, selected: v === st[key] }, v))));
     };
-    /** Subject name, appearance and voice in the settings pane, away from the
-     *  RefMod file names. Appearance only with a look, voice only with a voice. */
+    /** Subject name, appearance, retained attributes and voice in the settings
+     *  pane, away from the RefMod file names. Appearance and retained attributes
+     *  only with a look, voice only with a voice. */
     const subjectField = () => {
       const descInput = (label, value, hint, onset) => el("input", { class: "mmr-search", value: value || "",
         placeholder: hint, "aria-label": label, oninput: (e) => onset(e.target.value) });
@@ -2576,7 +2854,8 @@ export function openLibrary(panel, opts = {}) {
         const hasVoice = editing ? !!editing.audio || u.some((x) => x.voice && !isStored(x)) : u.some((x) => x.voice);
         const set = (key, v) => {
           if (editing) { editing[key] = v; paintBudget(); return; }
-          if (key === "subject") subjectName = v; else if (key === "appearance") appearanceText = v; else voiceText = v;
+          if (key === "subject") subjectName = v; else if (key === "appearance") appearanceText = v;
+          else if (key === "retained") retainedText = v; else voiceText = v;
         };
         return el("div", { class: "mmr-descfields" },
           el("label", { class: "mmr-ilabel", title: SUBJECT_TIP }, "Subject name",
@@ -2585,6 +2864,9 @@ export function openLibrary(panel, opts = {}) {
           hasLook ? el("label", { class: "mmr-ilabel", title: APPEARANCE_TIP }, "Appearance",
             descInput("Appearance", editing ? editing.appearance : appearanceText, "optional, like auburn hair and a green coat",
               (v) => set("appearance", v))) : null,
+          hasLook ? el("label", { class: "mmr-ilabel", title: RETAINED_TIP }, "Retained attributes",
+            descInput("Retained attributes", editing ? editing.retained : retainedText, RETAINED_HINT,
+              (v) => set("retained", v))) : null,
           hasVoice ? el("label", { class: "mmr-ilabel", title: VOICE_TIP }, "Voice",
             descInput("Voice", editing ? editing.voiceDesc : voiceText, "optional, like low, husky voice",
               (v) => set("voiceDesc", v))) : null);
@@ -2599,6 +2881,8 @@ export function openLibrary(panel, opts = {}) {
               el("input", { class: "mmr-search", value: x.subject || "", placeholder: "subject name", "aria-label": `Subject name for ${x.name}`,
                 oninput: (e) => { keepNameChars(e); x.subject = e.target.value.trim(); } })),
             isLook(x) ? descInput(`Appearance for ${x.name}`, x.appearance, "appearance, optional", (v) => { x.appearance = v; }) : null,
+            isLook(x) ? descInput(`Retained attributes for ${x.name}`, x.retained, "retained attributes, optional \u2014 tattoos, scars\u2026",
+              (v) => { x.retained = v; }) : null,
             x.voice ? descInput(`Voice for ${x.name}`, x.voiceDesc, "voice, optional", (v) => { x.voiceDesc = v; }) : null);
         })));
     };
@@ -2608,7 +2892,8 @@ export function openLibrary(panel, opts = {}) {
         el("div", { class: "mmr-fh" }, "Settings"),
         subjectField(),
         el("div", { class: "mmr-grid2" },
-          num("max_tokens", "Max tokens", 0, 1048576, 256, "Refuses to save anything bigger than this. 0 = no limit."),
+          num("max_tokens", "Max tokens", 0, 1048576, 256, "Refuses to save anything bigger than this, unless it's no " +
+            "bigger than the file already is. 0 = no limit."),
           num("latent_frames", "Clip frames", 1, 1024, 1, "Frames taken from the start of each added clip, after its trim.", clipFramesHint),
           num("audio_max_seconds", "Voice seconds", 0.5, 600, 0.5, "Seconds of a new voice kept from the start.")),
         el("div", { class: "mmr-fh", style: { marginTop: "8px" } }, "Models"),
@@ -2678,6 +2963,7 @@ export function openLibrary(panel, opts = {}) {
     if (from === to || from < 0 || to < 0 || from >= sources.length || to >= sources.length) return;
     const [m] = sources.splice(from, 1); sources.splice(to, 0, m); paintCreate();
   }
+  const SOURCE_WORD = { picture: "Image", video: "Video", audio: "Audio" };
   function sourceRow(x, i, setsFrame, target) {
     const k = x.rec.kind === "picture" ? "image" : x.rec.kind;
     const bits = [];
@@ -2700,13 +2986,16 @@ export function openLibrary(panel, opts = {}) {
           ? fitPreview(x.rec, target, setsFrame, () => `${x.name} · ` + (setsFrame ? "sets dataset size and aspect ratio"
               : effDims(x) ? fitCaption(fitOf(effDims(x)[0] / effDims(x)[1], target)).toLowerCase() : ""))
           : sourcePreview(x.rec, x.name),
-        el("span", { class: `mmr-kind ${KIND[k]?.cls || "pic"}` }, isStored(x) ? "STORED" : (KIND[k]?.short || "REF"))),
+        el("div", { class: "mmr-srckindrow" },
+          el("span", { class: `mmr-kind ${KIND[k]?.cls || "pic"}` }, isStored(x) ? "STORED" : (KIND[k]?.short || "REF")),
+          el("span", { class: "mmr-srcpos", title: "Place in the list — the order frames are stored in. Drag to reorder." },
+            `${x.stored != null ? "Frame" : x.storedVoice ? "Voice" : SOURCE_WORD[x.rec.kind] || "Source"} ${i + 1}/${sources.length}`))),
       el("div", { class: "mmr-srcmain" },
         combine || editing
           ? el("div", { class: "mmr-srctitle" }, el("b", {}, x.name),
               combine && setsFrame && used().filter(isLook).length > 1 ? el("span", { class: "mmr-framechip",
                 title: "Every photo in this RefMod is made this size and shape (portrait, landscape or square). " +
-                  (st.mode === "Full Reference" ? "The others have their edges trimmed to match." : "The others are squeezed to match.") },
+                  "The others have their edges trimmed to match." },
                 "Sets dataset size and aspect ratio") : null)
           : el("input", { class: "mmr-search", value: x.name, "aria-label": "RefMod name", onchange: (e) => {
               x.name = cleanName(e.target.value); e.target.value = x.name; if (x._subjLabel) x._subjLabel.textContent = x.name; } }),
@@ -2756,12 +3045,14 @@ export function openLibrary(panel, opts = {}) {
     // Create's resolution decides size, so a loader's size cap doesn't ride along.
     const recOf = (x) => { const r = { ...x.rec }; delete r.resize; if (r.kind === "video") r.audio_mode = x.voice ? "paired" : "off"; return r; };
     const groups = combine
-      ? [{ name: stackName || defaultStackName(), members: use, subject: subjectName, appearance: appearanceText, voiceDesc: voiceText }]
-      : use.map((x) => ({ name: x.name, members: [x], subject: x.subject || "", appearance: x.appearance || "", voiceDesc: x.voiceDesc || "" }));
+      ? [{ name: stackName || defaultStackName(), members: use, subject: subjectName, appearance: appearanceText, voiceDesc: voiceText,
+           retained: retainedText }]
+      : use.map((x) => ({ name: x.name, members: [x], subject: x.subject || "", appearance: x.appearance || "", voiceDesc: x.voiceDesc || "",
+           retained: x.retained || "" }));
     const names = groups.map((g) => g.name);
     if (names.some((n) => !n)) { toast("Every RefMod needs a name", 4000); return; }
     if (groups.some((g) => g.subject && !SUBJECT_OK.test(g.subject))) { toast(SUBJECT_RULE, 5000); return; }
-    if (groups.some((g) => oneLine(g.appearance).length > DESC_LIMIT || oneLine(g.voiceDesc).length > DESC_LIMIT)) {
+    if (groups.some((g) => [g.appearance, g.voiceDesc, g.retained].some((t) => oneLine(t).length > DESC_LIMIT))) {
       toast(DESC_RULE, 5000); return; }
     if (new Set(names).size !== names.length) { toast("Two sources have the same name", 4000); return; }
     const prompt = {}; let id = 1;
@@ -2776,6 +3067,7 @@ export function openLibrary(panel, opts = {}) {
         subject_name: g.subject || "",
         appearance: g.members.some(isLook) ? oneLine(g.appearance) : "",
         voice_description: g.members.some((x) => x.voice) ? oneLine(g.voiceDesc) : "",
+        retained_attributes: g.members.some(isLook) ? oneLine(g.retained) : "",
         write_preview: !!st.write_preview, source: JSON.stringify(g.members.map(recOf)) };
       if (vid && g.members.some(isLook)) inputs.vae = [vid, 0];
       if (aid && g.members.some((x) => x.voice)) inputs.audio_vae = [aid, 0];
@@ -2794,7 +3086,7 @@ export function openLibrary(panel, opts = {}) {
       }
       jobs.unshift({ prompt_id: d.prompt_id, names, status: "queued", msg: `#${d.number} in the queue`, progress: 0, saved: [] });
       hook(); watchJob(d.prompt_id); paintJobs();
-      subjectName = appearanceText = voiceText = "";   // these belong to the RefMod just made
+      subjectName = appearanceText = voiceText = retainedText = "";   // these belong to the RefMod just made
       toast(`Queued ${names.length === 1 ? names[0] : `${names.length} RefMods`}`);
     } catch (err) {
       toast(`Couldn't queue: ${err.message}`, 6000);
@@ -2823,7 +3115,8 @@ export function openLibrary(panel, opts = {}) {
       voice: plan.voice === "new" ? JSON.stringify(recOf(plan.newVoice)) : plan.voice, save_as: saveAs,
       subject_name: plan.nameChanged ? (plan.subject || "-") : "",
       appearance: plan.appearanceChanged ? (plan.appearance || "-") : "",
-      voice_description: plan.voiceDescChanged ? (plan.voiceDesc || "-") : "" };
+      voice_description: plan.voiceDescChanged ? (plan.voiceDesc || "-") : "",
+      retained_attributes: plan.retainedChanged ? (plan.retained || "-") : "" };
     if (vid) inputs.vae = [vid, 0];
     if (aid) inputs.audio_vae = [aid, 0];
     prompt[String(id++)] = { class_type: EDIT_NAME, inputs };
@@ -2850,16 +3143,28 @@ export function openLibrary(panel, opts = {}) {
     } finally { paintBudget(); }
   }
 
-  let hooked = false;
+  let hooked = false, gone = false;      // gone: this dialog is closed; its pollers stop
   const onEvt = {
-    executing: (e) => { const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (j && e.detail?.node) { j.status = "running"; j.msg = "encoding…"; paintJobs(); } },
+    executing: (e) => { const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (j && e.detail?.node) { j.status = "running"; j.msg = j.frames ? "decoding…" : "encoding…"; paintJobs(); } },
     progress: (e) => { const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (j && e.detail?.max) { j.progress = e.detail.value / e.detail.max; paintJobs(); } },
     executed: (e) => { if (inspectEvent("executed", e)) return; const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); const saved = e.detail?.output?.refmod_saved; if (j && saved) { j.saved.push(...saved); paintJobs(); } },
-    execution_error: (e) => { if (inspectEvent("error", e)) return; const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (j) { j.status = "error"; j.msg = e.detail?.exception_message || "failed"; paintJobs(); } },
+    execution_error: (e) => {
+      if (inspectEvent("error", e)) return;
+      const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (!j) return;
+      j.status = "error"; j.msg = e.detail?.exception_message || "failed"; paintJobs();
+      // files finished before the failure keep their frames
+      if (j.frames) { toast(`Couldn't store encoder frames: ${j.msg}`, 6000); load(true); }
+    },
     execution_success: async (e) => {
       if (inspectEvent("success", e)) return;
       const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (!j) return;
       j.status = "done"; j.msg = `saved ${j.saved.length} file${j.saved.length === 1 ? "" : "s"}`; j.progress = 1; paintJobs();
+      if (j.frames) {
+        await load(true);
+        toast(j.saved.length ? `Stored encoder frames in ${j.saved.length} RefMod${j.saved.length === 1 ? "" : "s"}`
+          : "Those RefMods already had their encoder frames");
+        return;
+      }
       if (j.edit) {
         // The file changed: forget its old decode, leave edit mode, show it.
         inspectResults.delete(j.edit);
@@ -2886,6 +3191,7 @@ export function openLibrary(panel, opts = {}) {
     setChildren(jobsEl, jobs.slice(0, 6).map((j) => el("div", { class: `mmr-job ${j.status}` },
       el("div", { class: "mmr-jobhead" }, el("span", {}, j.names.join(", ")), el("span", { class: "mmr-dim" }, j.msg)),
       j.status === "running" ? el("div", { class: "mmr-bar2" }, el("div", { style: { width: `${Math.round(j.progress * 100)}%` } })) : null)));
+    paintFramesBtn();
   }
 
   /* ---- data */
@@ -2898,7 +3204,7 @@ export function openLibrary(panel, opts = {}) {
       if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
       items = data.items || []; roots = data.roots || []; packInstalled = data.pack_installed !== false;
       if (vr && vr.ok) { try { const v = await vr.json(); vaes = Array.isArray(v) ? v : []; } catch (e) { vaes = []; } }
-      drawFolders(); drawGrid();
+      drawFolders(); drawGrid(); paintFramesBtn();
       if (view.selected) { if (byName(view.selected)) paintInspector(); else select(null); }
       if (rescan && panel) panel.refreshFrom(items);
     } catch (e) {
@@ -2906,8 +3212,16 @@ export function openLibrary(panel, opts = {}) {
       summary.textContent = "";
     }
   }
+  if (resume) resumeDraft(resume);
   paintTabs();
-  load(false).then(() => { if (view.tab === "create") paintCreate(); });
+  load(false).then(() => {
+    if (editing && !byName(editing.name)) {          // edited away or deleted while the library was shut
+      toast(`${editing.it.label} is no longer in the library — the edit was dropped.`, 5000);
+      cancelEdit(false); resumed = false; paintTabs();
+    }
+    if (opts.select) reveal(opts.select);
+    if (view.tab === "create") paintCreate();
+  });
   if (view.tab === "library") search.focus();
 }
 
@@ -2969,6 +3283,16 @@ app.registerExtension({
 app.registerExtension({
   name: "MiniMaxH3.RefModStack",
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (ENCODE_NAMES.has(nodeData.name)) {
+      // What feeds a Text Encode's references decides where RefMod labels start.
+      const prev = nodeType.prototype.onConnectionsChange;
+      nodeType.prototype.onConnectionsChange = function () {
+        const r = prev?.apply(this, arguments);
+        setTimeout(refreshStackLabels, 0);
+        return r;
+      };
+      return;
+    }
     if (nodeData.name !== STACK_NAME) return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;

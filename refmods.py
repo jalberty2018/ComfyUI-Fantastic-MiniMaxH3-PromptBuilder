@@ -191,6 +191,7 @@ def _channel(meta, rel, tensors):
         ch["steps"] = int(meta.get("optimize_steps", 0) or 0)
         ch["source"] = str(meta.get("source", "") or "")
         ch["source_shape"] = str(meta.get("source_shape", "") or "")
+        ch["frames"] = bool(meta.get("enc_times"))     # the text encoder's frames are in the file
         # A fork "combined" file carries the voice inside the visual file.
         # The original pack's loader reads only `latent`, so that audio never
         # reaches the model — worth saying, not worth hiding the file.
@@ -262,6 +263,7 @@ def scan_library():
                 ch["subject_name"] = str(m.get("subject_name", "") or meta.get("subject_name", "") or "")
                 ch["appearance"] = str(m.get("appearance", "") or meta.get("appearance", "") or "")
                 ch["voice_description"] = str(m.get("voice_description", "") or meta.get("voice_description", "") or "")
+                ch["retained_attributes"] = str(m.get("retained_attributes", "") or meta.get("retained_attributes", "") or "")
                 ch["concept"] = str(m.get("concept_type", "generic") or "generic")
                 ch["member"] = i
                 g[want] = ch
@@ -274,6 +276,7 @@ def scan_library():
         ch["subject_name"] = str(meta.get("subject_name", "") or "")
         ch["appearance"] = str(meta.get("appearance", "") or "")
         ch["voice_description"] = str(meta.get("voice_description", "") or "")
+        ch["retained_attributes"] = str(meta.get("retained_attributes", "") or "")
         ch["concept"] = str(meta.get("concept_type", "generic") or "generic")
         want = "audio" if ch["kind"] == "audio" else "visual"
         pair_base, role = _split_pair(base)
@@ -320,12 +323,14 @@ def scan_library():
             "subject_name": first.get("subject_name") or (aud.get("subject_name", "") if aud else ""),
             "appearance": first.get("appearance") or (aud.get("appearance", "") if aud else ""),
             "voice_description": (aud.get("voice_description") if aud else "") or first.get("voice_description", ""),
+            "retained_attributes": first.get("retained_attributes") or (aud.get("retained_attributes", "") if aud else ""),
             "preview": (f"{rel_dir}/{preview}" if rel_dir else preview) if preview else None,
             "paired": bool(vis and aud),
         }
         for c in (vis, aud):
             if c:
-                for k in ("desc", "concept", "meta_name", "subject_name", "appearance", "voice_description"):
+                for k in ("desc", "concept", "meta_name", "subject_name", "appearance", "voice_description",
+                          "retained_attributes"):
                     c.pop(k, None)
         if vis:
             item["visual"] = vis
@@ -353,8 +358,8 @@ DESCRIPTION_LIMIT = 300
 
 
 def clean_description(value, what="description"):
-    """Appearance or voice wording the prompt builder drafts into a definition
-    line: one line (a line break reads to the model as a shot cut), no
+    """Appearance, voice or retained-attribute wording the prompt builder
+    drafts into a prompt: one line (a line break reads to the model as a shot cut), no
     trailing full stop, up to DESCRIPTION_LIMIT characters. Empty clears it."""
     text = " ".join(str(value or "").split()).rstrip(" .")
     if len(text) > DESCRIPTION_LIMIT:
@@ -736,9 +741,10 @@ def rewrite_meta(files, **fields):
         rewrite_stem_meta(path, label=rel, **fields)
 
 
-def rewrite_stem_meta(path, label="", **fields):
+def rewrite_stem_meta(path, label="", add=None, **fields):
     """Rewrite one RefMod's header fields in place; the tensors are copied as
-    they are. `path` is a stem already resolved inside a RefMod root."""
+    they are, plus any in `add`. `path` is a stem already resolved inside a
+    RefMod root."""
     import torch  # noqa: F401  (safetensors.torch needs it)
     from safetensors.torch import load_file, save_file
     import tempfile
@@ -754,6 +760,7 @@ def rewrite_stem_meta(path, label="", **fields):
                 m[k] = v
     tensors = load_file(path + ".safetensors")
     tensors = {k: v.clone() for k, v in tensors.items()}
+    tensors.update(add or {})
     fd, tmp = tempfile.mkstemp(prefix=".refmod-", suffix=".tmp", dir=os.path.dirname(path))
     os.close(fd)
     try:

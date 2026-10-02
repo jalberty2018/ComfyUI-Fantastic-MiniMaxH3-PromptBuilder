@@ -17,13 +17,13 @@ import torch
 import comfy.utils
 import comfy.model_management as mm
 
-from .refmod_core import H3RefMod, load_cached
+from .refmod_core import H3RefMod, load_cached, encoder_record, stored_record
 from .refmod_create import (_cover, ensure_min_size, resize_ref, pool_latent, optimize_latent,
                             encode_audio, save_mod, snap_to_h3_grid, parse_sources,
                             load_look, load_voice)
 from .refmods import (resolve_file, _split_pair, _root_of, _contained_target, sanitize_name,
                       valid_rel, split_member, read_meta, clean_subject_name, clean_description, rewrite_stem_meta,
-                      PREVIEW_EXT)
+                      bundle_members, PREVIEW_EXT)
 
 
 def _first_source_px(mod):
@@ -37,6 +37,19 @@ def _first_source_px(mod):
         return 1024
 
 
+def _first_source_canvas(mod):
+    """The first source's own encode canvas in pixels, (w, h), from
+    source_shape; None when the header doesn't say. Compressed files pool
+    each source to one grid, so an added picture is cover-cropped to this
+    canvas first — trimmed to the file's shape, never squeezed into it."""
+    try:
+        first = str(mod.source_shape or "").split("+")[0].strip()
+        _t, h, w = (int(v) for v in first.split("x"))
+        return (w * 16, h * 16) if h > 0 and w > 0 else None
+    except Exception:
+        return None
+
+
 def encode_like(vae, mod, sources, latent_frames=16, progress=None):
     """Encode pictures/clips to match `mod`'s stored latent: same H x W, same
     mode, same refinement. Returns [1, 24, T_new, H, W] fp16 and the shapes."""
@@ -44,6 +57,7 @@ def encode_like(vae, mod, sources, latent_frames=16, progress=None):
     full = mod.mode == "encode"
     steps = int(mod.optimize_steps or 0)
     res = _first_source_px(mod)
+    canvas = None if full else _first_source_canvas(mod)
     parts, shapes = [], []
     for i, (src, is_video) in enumerate(sources):
         src = src if is_video else src[:1]
@@ -51,6 +65,8 @@ def encode_like(vae, mod, sources, latent_frames=16, progress=None):
             src = src[:snap_to_h3_grid(min(latent_frames, src.shape[0]))]
         if full:
             src = _cover(src, W * 16, H * 16)          # exact canvas: latent H x W
+        elif canvas:
+            src = _cover(src, *canvas)                  # the first source's shape, edges trimmed
         else:
             src = resize_ref(src, res)
         src = ensure_min_size(src)
@@ -77,13 +93,14 @@ def encode_like(vae, mod, sources, latent_frames=16, progress=None):
 # Header fields the prompt builder reads, and how each one is checked.
 PROMPT_FIELDS = (("subject_name", clean_subject_name),
                  ("appearance", lambda v: clean_description(v, "appearance")),
-                 ("voice_description", lambda v: clean_description(v, "voice description")))
+                 ("voice_description", lambda v: clean_description(v, "voice description")),
+                 ("retained_attributes", lambda v: clean_description(v, "retained attributes")))
 
 
-def _changes(subject_name="", appearance="", voice_description=""):
+def _changes(subject_name="", appearance="", voice_description="", retained_attributes=""):
     """The header fields to change: empty keeps a field, '-' clears it."""
     out = {}
-    for (key, clean), raw in zip(PROMPT_FIELDS, (subject_name, appearance, voice_description)):
+    for (key, clean), raw in zip(PROMPT_FIELDS, (subject_name, appearance, voice_description, retained_attributes)):
         text = (raw or "").strip()
         if text:
             out[key] = "" if text == "-" else clean(text)
@@ -97,7 +114,7 @@ class MiniMaxH3FantasticRefModEdit:
         "is a JSON list of frame indices and \"a<k>\" entries in the new order), "
         "add pictures or clips encoded to the same shape ('add' is a JSON list "
         "of Media Loader items), replace or remove its voice, and set its "
-        "subject name, appearance and voice description. Nothing already stored is re-encoded. Overwrites the file unless 'save_as' "
+        "subject name, appearance, voice description and retained attributes. Nothing already stored is re-encoded. Overwrites the file unless 'save_as' "
         "names a copy. Queued by the RefMod library's edit mode; the VAEs are "
         "only needed for additions."
     )
@@ -116,7 +133,7 @@ class MiniMaxH3FantasticRefModEdit:
                 "voice": ("STRING", {"default": "", "tooltip": "A Media Loader item (audio, or a clip with sound) to replace the voice; 'remove' to drop it; empty = unchanged."}),
                 "latent_frames": ("INT", {"default": 22, "min": 1, "max": 1024, "tooltip": "Frames taken from the start of an added clip; 22 stores 7 frames, 39 stores 12, 56 stores 17."}),
                 "audio_max_seconds": ("FLOAT", {"default": 30.0, "min": 0.5, "max": 600.0, "step": 0.5}),
-                "save_as": ("STRING", {"default": "", "tooltip": "Save the result as a new RefMod with this name (folders allowed, e.g. characters/hero_v2) and leave the original untouched. Empty = overwrite the original."}),
+                "save_as": ("STRING", {"default": "", "tooltip": "Save the result as a new RefMod with this name (folders allowed, e.g. characters/hero_v2) and leave the original untouched. Empty = overwrite the original, except for a ComfyUI-MiniMaxH3Mod bundle, which is always saved as a copy."}),
             },
             "optional": {
                 "vae": ("VAE", {"tooltip": "MiniMax H3 video VAE, for added pictures."}),
@@ -128,6 +145,9 @@ class MiniMaxH3FantasticRefModEdit:
                                           "Empty keeps the stored text; '-' clears it."}),
                 "voice_description": ("STRING", {"default": "", "tooltip": "How the voice sounds, drafted onto the voice line and "
                                                  "the speaker buttons. Empty keeps the stored text; '-' clears it."}),
+                "retained_attributes": ("STRING", {"default": "", "tooltip": "Specific small details that should be kept, drafted "
+                                                   "onto the end of the subject's retention note. Empty keeps the stored text; "
+                                                   "'-' clears it."}),
             },
         }
 
@@ -136,19 +156,19 @@ class MiniMaxH3FantasticRefModEdit:
         return float("nan")
 
     @classmethod
-    def VALIDATE_INPUTS(cls, file="", subject_name="", appearance="", voice_description=""):
+    def VALIDATE_INPUTS(cls, file="", subject_name="", appearance="", voice_description="", retained_attributes=""):
         if not (file or "").strip():
             return "Give the RefMod's file name."
         try:
-            _changes(subject_name, appearance, voice_description)
+            _changes(subject_name, appearance, voice_description, retained_attributes)
         except ValueError as exc:
             return str(exc)
         return True
 
     def edit(self, file, frames, add, voice, latent_frames, audio_max_seconds, save_as="", vae=None, audio_vae=None,
-             subject_name="", appearance="", voice_description=""):
+             subject_name="", appearance="", voice_description="", retained_attributes=""):
         # Header fields: empty keeps what's stored, '-' clears, anything else sets it.
-        changes = _changes(subject_name, appearance, voice_description)
+        changes = _changes(subject_name, appearance, voice_description, retained_attributes)
         audio_max_seconds = max(0.5, min(600.0, float(audio_max_seconds or 0) or 30.0))
         latent_frames = max(1, int(latent_frames or 16))
         rel = file.strip().replace("\\", "/")
@@ -160,26 +180,35 @@ class MiniMaxH3FantasticRefModEdit:
         if root is None:
             raise ValueError("That file is outside every RefMod folder.")
         head, _t = read_meta(stem)
-        if isinstance(head, dict) and head.get("kind") == "bundle":
-            raise ValueError(
-                f"'{split_member(rel)[0]}' is a single-file bundle from ComfyUI-MiniMaxH3Mod. "
-                "It can be used and inspected here, but not edited: save its members as "
-                "standalone files with that pack's Save H3 RefMods node first.")
-        mod = load_cached(stem)
         root_dir, base_name = os.path.dirname(stem), os.path.basename(stem)
-        pair_base, role = _split_pair(base_name)
-        # The other half of a pair, when there is one.
-        partner_stem = None
-        if role:
-            for suf in (("_audio", "_Audio") if role == "visual" else ("_visual", "_Video")):
-                cand = os.path.join(root_dir, pair_base + suf)
-                if os.path.isfile(cand + ".safetensors"):
-                    partner_stem = cand
-                    break
-        look_mod = mod if mod.kind != "audio" else (load_cached(partner_stem) if partner_stem else None)
-        look_stem = stem if mod.kind != "audio" else partner_stem
-        voice_mod = mod if mod.kind == "audio" else (load_cached(partner_stem) if partner_stem else None)
-        voice_stem = stem if mod.kind == "audio" else partner_stem
+        members = bundle_members(head)
+        if members:
+            # A ComfyUI-MiniMaxH3Mod bundle: its first look and first voice, as its
+            # library card shows them. The bundle stays as that pack wrote it.
+            if not (save_as or "").strip():
+                raise ValueError(f"'{split_member(rel)[0]}' is a single-file bundle from ComfyUI-MiniMaxH3Mod, "
+                                 "so an edit is saved as a copy: give save_as a name.")
+            look_i = next((i for i, m in enumerate(members) if m.get("kind") != "audio"), None)
+            voice_i = next((i for i, m in enumerate(members) if m.get("kind") == "audio"), None)
+            look_mod = load_cached(stem, look_i) if look_i is not None else None
+            voice_mod = load_cached(stem, voice_i) if voice_i is not None else None
+            mod, pair_base, role = look_mod or voice_mod, base_name, None
+            look_stem = voice_stem = None
+        else:
+            mod = load_cached(stem)
+            pair_base, role = _split_pair(base_name)
+            # The other half of a pair, when there is one.
+            partner_stem = None
+            if role:
+                for suf in (("_audio", "_Audio") if role == "visual" else ("_visual", "_Video")):
+                    cand = os.path.join(root_dir, pair_base + suf)
+                    if os.path.isfile(cand + ".safetensors"):
+                        partner_stem = cand
+                        break
+            look_mod = mod if mod.kind != "audio" else (load_cached(partner_stem) if partner_stem else None)
+            look_stem = stem if mod.kind != "audio" else partner_stem
+            voice_mod = mod if mod.kind == "audio" else (load_cached(partner_stem) if partner_stem else None)
+            voice_stem = stem if mod.kind == "audio" else partner_stem
         saved = []
         pbar = comfy.utils.ProgressBar(100)
 
@@ -291,7 +320,11 @@ class MiniMaxH3FantasticRefModEdit:
             os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
             if out_look is not None:
                 out_look = replace(out_look, name=base, **changes)
-                saved.append(save_mod(out_look, look_dest))
+                # changed frames are shown to the encoder anew (without a VAE the Text
+                # Encode decodes them once later); an unchanged look keeps its own
+                frames = (encoder_record(out_look, vae) if vae is not None else None) if edited is not None \
+                    else stored_record(out_look)
+                saved.append(save_mod(out_look, look_dest, frames))
             if out_voice is not None:
                 out_voice = replace(out_voice, name=base, **changes)
                 saved.append(save_mod(out_voice, voice_dest))
@@ -310,7 +343,7 @@ class MiniMaxH3FantasticRefModEdit:
             # --- in place
             final_look = look_stem
             if edited is not None:
-                saved.append(save_mod(edited, look_stem))
+                saved.append(save_mod(edited, look_stem, encoder_record(edited, vae) if vae is not None else None))
             if v:
                 if voice_stem is None and look_stem is not None:
                     # A plain <name> file gets the pair suffix once it has a voice.
@@ -352,5 +385,56 @@ class MiniMaxH3FantasticRefModEdit:
         return {"ui": {"refmod_saved": rel_saved}, "result": ("\n".join(rel_saved),)}
 
 
-NODE_CLASS_MAPPINGS = {"MiniMaxH3FantasticRefModEdit": MiniMaxH3FantasticRefModEdit}
-NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3FantasticRefModEdit": "Fantastic H3 Edit RefMod"}
+class MiniMaxH3FantasticRefModStoreFrames:
+    CATEGORY = "conditioning/video_models"
+    DESCRIPTION = (
+        "Add the frames H3's text encoder is shown to RefMods saved before they "
+        "carried them, so the RefMod Text Encode reads them instead of decoding "
+        "the RefMod. Each file is decoded once; its latent is not touched. Files "
+        "that already have them and voice files are left alone. Queued by the "
+        "RefMod library's Store encoder frames."
+    )
+    OUTPUT_NODE = True
+    RETURN_TYPES = ()
+    FUNCTION = "store"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "files": ("STRING", {"default": "", "multiline": True, "tooltip": "RefMod files under models/refmods, one per line, e.g. characters/hero_visual."}),
+                "vae": ("VAE", {"tooltip": "MiniMax H3 video VAE."}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def store(self, files, vae):
+        rels = [r.strip().replace("\\", "/") for r in files.splitlines() if r.strip()]
+        pbar = comfy.utils.ProgressBar(len(rels))
+        saved = []
+        for i, rel in enumerate(rels):
+            mm.throw_exception_if_processing_interrupted()
+            path = resolve_file(rel, (".safetensors",))
+            if not path:
+                raise FileNotFoundError(f"RefMod '{rel}' was not found under models/refmods.")
+            stem = path[:-len(".safetensors")]
+            mod = load_cached(stem)
+            if mod.kind != "audio" and not mod.enc_times:
+                packed, times, fps = encoder_record(mod, vae)
+                made = os.stat(path)
+                rewrite_stem_meta(stem, rel, add=packed, enc_times=times, enc_fps=fps)
+                # the library's Newest sort still means when the RefMod was made
+                os.utime(path, ns=(made.st_atime_ns, made.st_mtime_ns))
+                saved.append(rel)
+            pbar.update_absolute(i + 1)
+        print(f"[MiniMaxH3FantasticRefModStoreFrames] stored encoder frames in {len(saved)} of {len(rels)} files")
+        return {"ui": {"refmod_saved": saved}}
+
+
+NODE_CLASS_MAPPINGS = {"MiniMaxH3FantasticRefModEdit": MiniMaxH3FantasticRefModEdit,
+                       "MiniMaxH3FantasticRefModStoreFrames": MiniMaxH3FantasticRefModStoreFrames}
+NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3FantasticRefModEdit": "Fantastic H3 Edit RefMod",
+                              "MiniMaxH3FantasticRefModStoreFrames": "Fantastic H3 Store RefMod Encoder Frames"}

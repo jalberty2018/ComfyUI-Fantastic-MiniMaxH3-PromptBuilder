@@ -28,7 +28,7 @@ import comfy.utils
 import comfy.model_management as mm
 
 from . import media_io
-from .refmod_core import H3RefMod
+from .refmod_core import H3RefMod, encoder_record
 from .refmods import search_dirs, valid_rel, sanitize_name, _contained_target, clean_subject_name, clean_description, PREVIEW_EXT
 
 CONCEPT_TYPES = ("generic", "identity", "pose_motion", "clothing", "background",
@@ -158,9 +158,10 @@ def encode_look(vae, sources, *, mode, ref_resolution, grid, latent_frames,
     `sources` is [(frames [N,H,W,3], is_video)]. Each is encoded on its own
     and the results are joined, one latent frame per picture and a short
     sequence per clip. They must share a frame size, so the first source
-    sets it: Full cover-crops the others to its canvas, Compressed pools
-    every one to a grid shaped like it — the same rules as
-    ComfyUI-MiniMaxH3Mod's Create node."""
+    sets it and the others are cover-cropped to its canvas — edges trimmed,
+    never squeezed — in both modes. (Compressed used to pool each photo to
+    the first one's grid as it was, which squashed anything of a different
+    shape; a distorted face is a worse reference than a cropped one.)"""
     try:
         from comfy.ldm.minimax.vae import MiniMaxH3VideoVAE
         if not isinstance(vae.first_stage_model, MiniMaxH3VideoVAE):
@@ -174,7 +175,7 @@ def encode_look(vae, sources, *, mode, ref_resolution, grid, latent_frames,
             raise ValueError(f"{label}: expected an IMAGE batch, got {tuple(frames.shape)}")
     h0, w0 = sources[0][0].shape[1], sources[0][0].shape[2]
     canvas = None
-    if mode == "encode" and len(sources) > 1:
+    if len(sources) > 1:
         scale = min(1.0, ref_resolution / min(h0, w0))
         canvas = (max(32, round(w0 * scale / 32) * 32), max(32, round(h0 * scale / 32) * 32))
     gh, gw = aspect_grid(grid, h0 / w0)
@@ -309,7 +310,10 @@ def target_root():
     return dirs[0]
 
 
-def save_mod(mod, path_no_ext):
+def save_mod(mod, path_no_ext, frames=None):
+    """Write a RefMod. `frames` is the text encoder's frames (packed, their
+    timestamps, the fps they were picked at), stored beside the latent so the
+    Text Encode never decodes this RefMod."""
     os.makedirs(os.path.dirname(path_no_ext) or ".", exist_ok=True)
     meta = {
         "name": mod.name, "kind": mod.kind,
@@ -321,14 +325,18 @@ def save_mod(mod, path_no_ext):
     }
     if mod.config:
         meta["refmod_config"] = json.dumps(mod.config)
-    for key in ("subject_name", "appearance", "voice_description"):
+    for key in ("subject_name", "appearance", "voice_description", "retained_attributes"):
         if getattr(mod, key, ""):
             meta[key] = getattr(mod, key)
     dest = path_no_ext + ".safetensors"
     fd, tmp = tempfile.mkstemp(prefix=".refmod-", suffix=".tmp", dir=os.path.dirname(dest) or ".")
     os.close(fd)
     try:
-        save_file({"latent": mod.latent.contiguous()}, tmp, metadata={"refmod_meta": json.dumps(meta)})
+        tensors = {"latent": mod.latent.contiguous()}
+        if frames:
+            packed, meta["enc_times"], meta["enc_fps"] = frames
+            tensors.update(packed)
+        save_file(tensors, tmp, metadata={"refmod_meta": json.dumps(meta)})
         os.replace(tmp, dest)
     finally:
         if os.path.exists(tmp):
@@ -447,7 +455,7 @@ class MiniMaxH3FantasticRefModCreate:
                 "subfolder": ("STRING", {"default": "", "tooltip": "Folder under models/refmods, e.g. characters."}),
                 "mode": (list(MODES.keys()), {"default": "Compressed Reference",
                     "tooltip": "Full keeps the most detail and is heavier to use. Compressed keeps the overall look and is much lighter."}),
-                "ref_resolution": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 32,
+                "ref_resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 32,
                     "tooltip": "Short edge each source is scaled down to before encoding (never up)."}),
                 "grid": ("INT", {"default": 16, "min": 2, "max": 64, "step": 2,
                     "tooltip": "Compressed: size of the small grid on its long edge. 16 is up to 64 tokens per frame."}),
@@ -476,6 +484,9 @@ class MiniMaxH3FantasticRefModCreate:
                     "into the subject's definition line. Kept in the file's header."}),
                 "voice_description": ("STRING", {"default": "", "tooltip": "Optional: how the voice sounds. Draft from RefMods adds it to "
                     "the voice line, and the speaker buttons use it. Kept in the file's header."}),
+                "retained_attributes": ("STRING", {"default": "", "tooltip": "Optional: specific small details that should be kept, "
+                    "such as tattoos or a scar. Draft from RefMods adds them to the end of the subject's retention note. "
+                    "Kept in the file's header."}),
                 "image": ("IMAGE", {"tooltip": "Look: one image, or a clip's frames at 24 fps. Replaces the source's pictures and clips."}),
                 "audio": ("AUDIO", {"tooltip": "Voice. Replaces the source's audio."}),
                 "vae": ("VAE", {"tooltip": "MiniMax H3 video VAE."}),
@@ -488,7 +499,8 @@ class MiniMaxH3FantasticRefModCreate:
         return float("nan")            # a save is a side effect: always run
 
     @classmethod
-    def VALIDATE_INPUTS(cls, name="", subfolder="", subject_name="", appearance="", voice_description=""):
+    def VALIDATE_INPUTS(cls, name="", subfolder="", subject_name="", appearance="", voice_description="",
+                        retained_attributes=""):
         # No **kwargs here on purpose: ComfyUI skips every input's min/max
         # check for a node whose validator takes **kwargs, which is how a
         # cleared "Voice seconds" box once reached the encoder as 0.
@@ -501,6 +513,7 @@ class MiniMaxH3FantasticRefModCreate:
             clean_subject_name(subject_name)
             clean_description(appearance, "appearance")
             clean_description(voice_description, "voice description")
+            clean_description(retained_attributes, "retained attributes")
         except ValueError as exc:
             return str(exc)
         return True
@@ -508,11 +521,13 @@ class MiniMaxH3FantasticRefModCreate:
     def create(self, name, subfolder, mode, ref_resolution, grid, latent_frames,
                refinement_steps, max_tokens, audio_max_seconds, concept_type,
                description, write_preview, source, image=None, audio=None,
-               vae=None, audio_vae=None, subject_name="", appearance="", voice_description=""):
+               vae=None, audio_vae=None, subject_name="", appearance="", voice_description="",
+               retained_attributes=""):
         subject_name = clean_subject_name(subject_name)
         described = {"subject_name": subject_name,
                      "appearance": clean_description(appearance, "appearance"),
-                     "voice_description": clean_description(voice_description, "voice description")}
+                     "voice_description": clean_description(voice_description, "voice description"),
+                     "retained_attributes": clean_description(retained_attributes, "retained attributes")}
         mode_key = MODES.get(mode, "training")
         audio_max_seconds = max(0.5, min(600.0, float(audio_max_seconds or 0) or 30.0))
         items = parse_sources(source)
@@ -565,6 +580,7 @@ class MiniMaxH3FantasticRefModCreate:
                 optimize_steps=refinement_steps if mode_key == "training" else 0,
                 tags=[tag], description=description or "", concept_type=concept_type,
                 **described), info)
+            look_frames = encoder_record(look[0], vae)
         pbar.update_absolute(75)
         vmod = None
         if voice is not None:
@@ -583,7 +599,8 @@ class MiniMaxH3FantasticRefModCreate:
                 mod, info = look
                 stem = os.path.join(root, base + ("_visual" if both else ""))
                 mod.path = stem
-                saved.append(save_mod(mod, stem))
+                saved.append(save_mod(mod, stem, look_frames))
+                mod.enc_times, mod.enc_fps = look_frames[1], look_frames[2]
                 mods.append((mod, 1.0))
                 for n in info["notes"]:
                     print(f"[MiniMaxH3FantasticRefModCreate] {clean}: {n}")
