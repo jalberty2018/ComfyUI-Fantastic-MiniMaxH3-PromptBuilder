@@ -1,4 +1,7 @@
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from . import sam_loader
+NODE_CLASS_MAPPINGS = {**NODE_CLASS_MAPPINGS, **sam_loader.NODE_CLASS_MAPPINGS}
+NODE_DISPLAY_NAME_MAPPINGS = {**NODE_DISPLAY_NAME_MAPPINGS, **sam_loader.NODE_DISPLAY_NAME_MAPPINGS}
 
 # The RefMod Stack is optional on top of the core nodes: a failure here
 # should cost that one node, not the builder and loader.

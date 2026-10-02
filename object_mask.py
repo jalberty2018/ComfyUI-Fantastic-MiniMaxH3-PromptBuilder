@@ -5,7 +5,7 @@ changed or removed.
 The Media Loader's Mask for editing panel queues this node on its own, the way
 the RefMod library queues Create — nothing on the canvas runs. It uses core
 ComfyUI's SAM 3 nodes and nothing else: the checkpoint is whatever the user
-put in models/checkpoints; this pack never downloads one.
+put in models/checkpoints; sam_loader downloads the default if missing.
 
 Dots can go on several frames. Each marked frame is segmented from its own
 dots (and the typed name, which picks the match under them) and tracked

@@ -1,1 +1,2 @@
 av
+huggingface_hub>=0.23

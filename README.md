@@ -1456,7 +1456,11 @@ becomes.
 
 **What you need:** the SAM 3.1 checkpoint,
 [`sam3.1_multiplex_fp16.safetensors`](https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors),
-in `models/checkpoints`. The pack never downloads it.
+in `models/checkpoints`. If it is missing, Auto Mask downloads it automatically
+from Comfy-Org on Hugging Face when you run it. Progress appears in the ComfyUI
+console. Existing checkpoints (including extra model paths) are reused; manual
+masks need no download. Install this pack's requirements and restart ComfyUI
+after updating.
 
 **Masking.** Right-click a video on the Media Loader → **◐ Mask for
 editing…** (or the **◐ Mask** tab in its trim editor). It works on the clip

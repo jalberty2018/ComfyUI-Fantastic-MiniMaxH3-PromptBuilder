@@ -2390,7 +2390,7 @@ function armTwice(btn, armedLabel, fn) {
   return btn;
 }
 const setKids = (node, kids) => node.replaceChildren(...[kids].flat(Infinity).filter((k) => k != null));
-const SAM_LINK = "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors";
+const SAM_AUTO = "Auto (download SAM 3.1 if missing)";
 const SAM_KEY = "mmh3.samCheckpoint";
 
 const CLEANUP_KEY = "mmh3.maskCleanupMB";
@@ -3955,13 +3955,10 @@ class MaskMode {
     let saved = "";
     try { saved = localStorage.getItem(SAM_KEY) || ""; } catch (e) {}
     const sam = list.filter((c) => /sam3/i.test(c));
-    setKids(this.ckpt, list.map((c) => el("option", { value: c }, c)));
-    this.ckpt.value = list.includes(saved) ? saved : (sam[0] || "");
+    setKids(this.ckpt, [SAM_AUTO, ...list].map((c) => el("option", { value: c }, c)));
+    this.ckpt.value = [SAM_AUTO, ...list].includes(saved) ? saved : (sam[0] || SAM_AUTO);
     if (!sam.length) {
-      setKids(this.status, el("span", {}, "No SAM 3.1 checkpoint found for Auto Mask. Put ",
-        el("a", { href: SAM_LINK, target: "_blank", rel: "noopener" }, "sam3.1_multiplex_fp16.safetensors"),
-        " in models/checkpoints, then reopen the editor. Nothing is downloaded for you."));
-      this.status.className = "mml-mkstatus err";
+      this.say("SAM 3.1 will download automatically when you run Auto Mask. Download progress appears in the ComfyUI console.");
     }
   }
 
@@ -3977,7 +3974,7 @@ class MaskMode {
     const end = h.end >= h.dur - 0.05 ? 0 : +h.end.toFixed(3);
     const mode = layer.result ? (layer.runMode || "replace") : "replace";
     const prompt = {
-      1: { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: this.ckpt.value } },
+      1: { class_type: "MiniMaxH3SAMLoader", inputs: { ckpt_name: this.ckpt.value } },
       2: { class_type: MASK_NODE, inputs: { model: ["1", 0], clip: ["1", 1], video: h.item.file, text, points,
         start: +h.start.toFixed(3), end, threshold: 0.5, max_objects: 4, mode,
         base: mode === "replace" ? "" : layer.result, every_frame: !!layer.everyFrame } },
@@ -3985,7 +3982,7 @@ class MaskMode {
     this.running = layer.id;
     this.renderPanel();
     const skipped = (layer.marks || []).length - frames.length;
-    this.say("Masking… (in the queue; a running generation finishes first)" +
+    this.say("Preparing Auto Mask… (downloads SAM 3.1 if needed; a running generation finishes first)" +
       (skipped ? ` — ${skipped} frame(s) with only red dots are skipped` : ""));
     try {
       const r = await api.fetchApi("/prompt", { method: "POST", headers: { "Content-Type": "application/json" },

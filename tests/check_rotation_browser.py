@@ -80,6 +80,12 @@ function geometry(m) {
   await settle(); geometry(video);
   video.setMaskMode(true); await settle(); geometry(video);
   check(video.masker && !video.maskSide.hidden,'Mask editor opens beside preview');
+  check(video.masker.ckpt.value===SAM_AUTO,'Missing SAM defaults to automatic download');
+  let queued=null;
+  api.fetchApi=async (path,opts)=>{queued=JSON.parse(opts.body);return {ok:false,json:async()=>({error:'Test stops before GPU execution'})};};
+  await video.masker.run({id:'test-auto',text:'person',marks:[]});
+  check(queued.prompt['1'].class_type==='MiniMaxH3SAMLoader','Auto Mask queues the download-capable loader');
+  check(queued.prompt['1'].inputs.ckpt_name===SAM_AUTO,'Auto choice reaches loader');
   video.setMaskMode(false); await settle(); geometry(video); video.close();
   result.textContent=JSON.stringify({ok:true,checks});
 })().catch(e=>{result.textContent=JSON.stringify({ok:false,checks,error:e.stack});});

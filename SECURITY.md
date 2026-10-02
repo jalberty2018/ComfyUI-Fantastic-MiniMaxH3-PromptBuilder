@@ -123,3 +123,12 @@ Before each release:
 
 If you believe you have found a vulnerability, open an issue on the
 repository or contact the maintainer through the GitHub profile.
+
+## SAM checkpoint download
+
+Running Auto Mask with the automatic model choice downloads the fixed
+`Comfy-Org/sam3.1` checkpoint through `huggingface_hub` if it is not installed.
+The destination is `models/checkpoints`; registered extra model paths are
+checked first. No user-supplied download URLs are accepted. Downloads run in
+the execution queue, with Hub file locking and incomplete-download staging.
+Opening the editor or using manual mask layers does not start a download.
