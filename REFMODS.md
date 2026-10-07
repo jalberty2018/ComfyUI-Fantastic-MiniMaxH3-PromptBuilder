@@ -96,7 +96,16 @@ understands RefMods:
   8, or all. More pictures may help lock in identity and reduce bleeding
   between RefMods, but they increase memory use and generation time.
 - **reference_map** is a text output listing every label and where it
-  came from. Handy for checking with a preview node.
+  came from. Handy for checking with a preview node. **Fantastic H3
+  Reference Map** gives the same text without encoding, from the same
+  references and mods. It shows the text as you edit the graph, before
+  anything is queued, with **⧉ Copy** for pasting it into an LLM, and
+  outputs it for an LLM node that writes the prompt.
+- The node itself lists its references in the order the model reads them,
+  each label with its file or RefMod, media first and then RefMods. It
+  updates as you change the graph, so you can check the order without
+  queueing. Click its heading to fold it. **▦ Thumbnails…** shows them all
+  as small previews, each RefMod with its tags and tokens.
 
 To show a RefMod to H3's text encoder, the Text Encode needs it as pictures.
 RefMods made or edited with a VAE keep those frames inside their file,
@@ -167,10 +176,78 @@ size and aspect ratio*.
 - Each preview shows what will be cut off
   to fit.
 - To choose which part is kept instead of taking the middle, click
-  **Crop to fit…** on a photo. The box is locked to the right aspect ratio, so
-  just drag it over the part you want.
+  **Crop and mask…** on a photo. The crop box is locked to the right aspect
+  ratio, so just drag it over the part you want.
 
 Hover over any preview to see it larger.
+
+### Crop to the subject and blur the background
+
+**Batch Masking** in the settings finds who or what the RefMod is of in
+every picture and clip, using SAM 3.1. It needs
+`sam3.1_multiplex_fp16.safetensors` in `models/checkpoints`, the same file
+**Mask for editing** uses. Nothing is downloaded for you.
+
+- Type what to mask, like `person`, and click **Find and Mask All**. For the identity
+  and pose/motion concepts, the box starts as `person`. Every picture and
+  clip goes through the queue as one job. Each picture keeps its largest
+  match; tick **Keep every match** for a RefMod of more than one person.
+  A picture with its own word (see below) uses that, and pictures you
+  brushed are left alone.
+- **Crop to subject** crops each picture and clip around what was found,
+  with room around it set by **Margin** (1.75× by default). In a stack, the
+  crop takes the first photo's shape. It only grows to fit that shape, so
+  nothing is squashed. A crop you move by hand stays as you left it;
+  **Back to auto** on its row hands it back.
+- **Blur background** blurs everything but the subject before it's
+  encoded, so props and backgrounds don't bleed into the RefMod:
+  - **Blur** sets how strong the blur is.
+  - **Grow** widens the subject first, so hair and edges stay sharp.
+  - **Edge** softens the border so the blur fades in.
+
+  All three are in pixels of the picture as it's encoded, so they look the
+  same at any resolution. The blur doesn't change the token count; a
+  tighter crop can lower it.
+**Crop and mask…** on a row (**Trim, crop and mask…** on a clip) opens the
+editor with the mask drawn over the picture. **‹ ›**, `,` and `.`, or PgUp
+and PgDn step through every source. Its masking bar works on that picture
+alone:
+
+- **What to mask**: left empty, it uses Batch Masking's word. Type in it
+  to give this picture its own; Enter runs Auto mask.
+- **▶ Auto mask** masks the picture with SAM from the word and any dots.
+  To steer it, click **◉ Dots**, then left-click what to mask and
+  right-click what to leave out. It starts fresh: brush strokes on the
+  picture are dropped.
+- **✎ Brush** paints the mask by hand: **Paint** adds to it, **Erase**
+  takes away, **Size** sets the brush. Ctrl+Z undoes a stroke and **Clear
+  brush** removes them all. On a clip, a stroke covers every frame. It
+  works without Auto mask too, for masking by hand.
+- **Mask | Result** switches between the mask and the blurred result.
+- Under them are the picture's own settings. Each follows Batch Masking
+  until you change it here; a changed one is marked, and **Use batch
+  settings** hands them all back.
+
+**Apply** or **‹ ›** keeps what you did in the window. Closing it with
+unsaved changes asks first.
+A crop that follows the subject moves with the brush and the margin.
+
+A row is flagged when:
+
+- **Small crop**: the crop is under 60% of the resolution the RefMod is
+  made at.
+- **Subject cut off**: the stack's shape can't fit around the subject at
+  that margin.
+- **No subject found**, or **Nothing left masked** after the brush: that
+  picture is kept whole and isn't blurred.
+- **Auto mask again**: a clip's trim or Clip frames changed, or the masks
+  were cleaned up while the library was closed.
+
+The masks are temporary. They're deleted once the RefMod is made, and
+**Clean up** clears any left over. What was done is saved in the RefMod
+itself: its library card shows **bg blurred** (or **subject crop**), and
+Details lists Batch Masking's word, margin and blur. Editing it later
+starts from those settings.
 
 ### Clips
 
@@ -178,7 +255,7 @@ A clip becomes a short run of stored frames, so the model can read a
 motion or a look in movement. Two things to know:
 
 - **Trim first.** Only the start of the clip is used, so trim it in the
-  Media Loader (or with **Crop / trim…** here) to the moment you want.
+  Media Loader (or with **Trim, crop and mask…** here) to the moment you want.
 - **Clip frames** is how many frames are taken from that start. H3 stores
   frames in chunks: 2 stored frames for anything up to 17, then 5 more for
   each further 17. So 22 frames store 7, 39 store 12, 56 store 17, and
@@ -205,8 +282,11 @@ Not sure? Make one of each and try them with the same prompt.
 Add an audio file, or tick **include its soundtrack as a voice** on a
 clip. The voice is saved alongside the look as part of the same RefMod.
 **Voice seconds** sets how much of the recording is kept, counted from the
-start. A clean recording of just the one voice, without music or
-background noise, gives the best result.
+start. To keep a particular stretch instead, click **Trim…** on the voice's
+row: a trimmed voice keeps its whole trim, whatever Voice seconds says. The
+row shows how much is kept, and the line under Create adds the voice's
+tokens, about 80 a second. A clean recording of just the one voice, without
+music or background noise, gives the best result.
 
 ### 6. Create
 
@@ -297,10 +377,20 @@ jobs already running in your ComfyUI queue have finished.
   **Appearance**, **Retained attributes** and **Voice** in the settings on
   the right. If that's all
   you change, only the file's header is rewritten.
+- **Blur the background of stored frames** (Full RefMods only): click
+  **Find and Mask All** in Batch Masking, and the stored frames get their
+  background blurred when you save. **Background kept** sets how much of
+  it stays; 0% blurs it fully. **Mask…** on a stored frame opens it in the
+  same window, with Auto mask, the brush, and Background kept and Grow for
+  that frame alone; **Result** decodes it with the blur, so you can check
+  it first. The blur is applied to the
+  stored frame itself, so its edge follows the frame's 16-pixel blocks.
+  A Compressed RefMod holds too little detail for this, but pictures you
+  add to one still get cropped and blurred.
 
 Editing never re-encodes what's already in a RefMod. Frames you keep are
-copied exactly as they were, and only the photos, clips or voice you add
-get encoded.
+copied exactly as they were, unless you blur their background, and only
+the photos, clips or voice you add get encoded.
 
 **RefMods made from a video clip:** a clip's frames were encoded together,
 so they're marked **part of a clip**. Keep those together and in their
@@ -461,7 +551,9 @@ Its **Retained attributes**, for the small details the model should hold on
 to, close the subject's `retention_analysis` note:
 `<Subject 1>'s identity and appearance from <Video 1> are retained. Face, facial features, body type. A small rose tattoo on her left wrist.`
 Its **Voice** goes in the small voice box beside its `<Audio N>` line, and
-the prompt adds *It is a low, husky voice with a slow, warm pace.*
+the prompt adds *It is a low, husky voice with a slow, warm pace.* With a
+subject name it says whose voice it is: *It is Ann's voice: low, husky voice
+with a slow, warm pace.*
 
 The speaker buttons in the dialogue row use it. When a speaker has a voice
 line, their button gets an arrow with two choices:
@@ -512,7 +604,7 @@ above 1 can help.
 
 **My photos came out cropped strangely.**
 They all follow the first photo's resolution and aspect ratio. Reorder so your best-framed photo
-is first, or use **Crop to fit…** on the others.
+is first, or use **Crop and mask…** on the others.
 
 **No RefMods loaded** shows in the editor.
 The stack is connected but empty, or every row is switched off. Add some
