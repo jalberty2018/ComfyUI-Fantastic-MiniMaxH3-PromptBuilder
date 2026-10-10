@@ -1232,6 +1232,13 @@ loaders into our Text Encode.
 
 ### The library
 
+**Fantastic H3 RefMod Upload Stack** adds direct file upload: click an empty
+slot and select a `.safetensors` RefMod. **Browse library…** remains available.
+Uploads are saved in unique folders under `models/refmods` and can be reused
+from the library. Files must contain embedded RefMod metadata; ordinary model
+checkpoints and files requiring a separate JSON sidecar are not supported.
+Weights, presets, theme support and chaining work like the original stack.
+
 **Fantastic H3 RefMod Stack** holds every pick in one node. **Browse
 library…** opens the library: a thumbnail grid of everything under your
 `refmods` folders (including any mapped in `extra_model_paths.yaml`), with

@@ -7,10 +7,12 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { postApi, LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL, openCropEditor, keepNameChars, outputTargets, setterOf,
-         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_LINK, samCheckpoints } from "./medialoader.js";
+         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_LINK, samCheckpoints, fantasticThemeCSS } from "./medialoader.js";
 
 
 export const STACK_NAME = "MiniMaxH3RefModStack";
+export const UPLOAD_STACK_NAME = "MiniMaxH3RefModUploadStack";
+export const STACK_NAMES = new Set([STACK_NAME, UPLOAD_STACK_NAME]);
 const BUILDER_NAME = "MiniMaxH3PromptBuilder";
 // Either pack's Text Encode labels a bundle the same way.
 export const ENCODE_NAMES = new Set(["MiniMaxH3FantasticRefModTextEncode",
@@ -163,7 +165,7 @@ function chainOf(node) {
   const up = [];
   let n = stackAbove(node), guard = 0, partial = false;
   while (n && guard++ < 32) {
-    if (n.type !== STACK_NAME) { partial = true; break; }
+    if (!STACK_NAMES.has(n.type)) { partial = true; break; }
     up.unshift(n);
     n = stackAbove(n);
   }
@@ -172,7 +174,7 @@ function chainOf(node) {
   guard = 0;
   while (cur && guard++ < 32) {
     const slot = (cur.outputs || []).findIndex((o) => o.name === "mods");
-    const next = slot < 0 ? null : outputTargets(cur, slot).find((t) => t?.type === STACK_NAME);
+    const next = slot < 0 ? null : outputTargets(cur, slot).find((t) => STACK_NAMES.has(t?.type));
     if (!next || down.includes(next)) break;
     down.push(next);
     cur = next;
@@ -730,7 +732,7 @@ const CSS = `
 
 function injectCSS() {
   if (document.getElementById("mmr-css")) return;
-  document.head.append(el("style", { id: "mmr-css", textContent: CSS }));
+  document.head.append(el("style", { id: "mmr-css", textContent: fantasticThemeCSS(CSS) }));
 }
 
 /* ------------------------------------------------------ the panel */
@@ -937,11 +939,39 @@ class StackPanel {
   }
 
   emptySlot(i) {
+    const upload = this.node.type === UPLOAD_STACK_NAME;
+    const activate = () => upload ? this.chooseUpload() : openLibrary(this);
     return el("div", { class: "mmr-slot empty", role: "button", tabindex: 0,
-      title: "Add a RefMod from the library",
-      onclick: () => openLibrary(this),
-      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openLibrary(this); } } },
-      `refmod ${i + 1}`);
+      title: upload ? "Upload a .safetensors RefMod" : "Add a RefMod from the library",
+      onclick: activate,
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); } } },
+      this.uploading ? "Uploading…" : `refmod ${i + 1}`);
+  }
+
+  chooseUpload() {
+    if (this.uploading) return;
+    const input = el("input", { type: "file", accept: ".safetensors",
+      onchange: async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        if (!/\.safetensors$/i.test(file.name)) { toast("Choose a .safetensors RefMod", 5000); return; }
+        this.uploading = true;
+        this.render();
+        try {
+          const body = new FormData();
+          body.append("file", file);
+          const response = await postApi("/minimax_h3/refmods/upload", { body });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
+          this.add(data.item);
+        } catch (error) {
+          toast(`RefMod upload failed: ${error.message}`, 7000);
+        } finally {
+          this.uploading = false;
+          this.render();
+        }
+      } });
+    input.click();
   }
 
   card(p, i, groups) {
@@ -2539,6 +2569,8 @@ export function openLibrary(panel, opts = {}) {
   const form = el("div", { class: "mmr-form" });
   const budgetEl = el("div", { class: "mmr-budgetline" });
   const createBtn = el("button", { class: "mmr-btn primary", onclick: () => submit() }, "Create");
+  const createDownloadBtn = el("button", { class: "mmr-btn", onclick: () => submit(true),
+    title: "Create the RefMod in the library and download its .safetensors file" }, "Create & download .safetensors");
   const pullSel = el("select", { class: "mmr-sel", "aria-label": "Pull from a Media Loader" });
   // Click target only: drops are taken by the whole dialog (see below).
   const drop = el("div", { class: "mmr-drop", onclick: () => dropIn.click() },
@@ -2551,7 +2583,8 @@ export function openLibrary(panel, opts = {}) {
       el("button", { class: "mmr-btn", onclick: () => pull() }, "Pull")),
     el("div", { class: "mmr-createbody" },
       el("div", { class: "mmr-ccol" }, drop, srcBar, sourceList),
-      el("div", { class: "mmr-ccol" }, form, el("div", { class: "mmr-crow" }, createBtn), budgetEl, jobsEl)));
+      el("div", { class: "mmr-ccol" }, form, el("div", { class: "mmr-crow" }, createBtn),
+        el("div", { class: "mmr-crow" }, createDownloadBtn), budgetEl, jobsEl)));
 
   // One RefMod from everything (a stack) is the default; one per source is
   // for turning a batch of unrelated items into separate references.
@@ -2811,6 +2844,7 @@ export function openLibrary(panel, opts = {}) {
         (editing.copy ? ` · saved as "${copyTo}"` : "");
       budgetEl.className = "mmr-budgetline " + cls;
       budgetEl.textContent = (cls ? "⚠ " : "") + line;
+      createDownloadBtn.style.display = "none";
       createBtn.disabled = blocked || (!plan.changed && !editing.copy) || !!editing.decodeError;
       createBtn.textContent = blocked ? "Can't save" : editing.copy ? "Save as a copy" : plan.changed ? "Save changes" : "No changes";
       return;
@@ -2846,6 +2880,8 @@ export function openLibrary(panel, opts = {}) {
     budgetEl.className = "mmr-budgetline " + cls;
     budgetEl.textContent = (cls ? "⚠ " : "") + line;
     const n = u.length;
+    createDownloadBtn.style.display = "";
+    createDownloadBtn.disabled = !n || blocked;
     createBtn.disabled = !n || blocked;
     createBtn.textContent = blocked ? (taken.length ? "Name taken" : "Over the token limit")
       : !n ? "Create" : combine ? "Create 1 RefMod" : `Create ${n} RefMod${n === 1 ? "" : "s"}`;
@@ -3619,7 +3655,7 @@ export function openLibrary(panel, opts = {}) {
   }
 
   /* ---- submit through the queue */
-  async function submit() {
+  async function submit(download = false) {
     if (editing) return submitEditPlan();
     const use = used();
     if (!use.length) return;
@@ -3662,6 +3698,7 @@ export function openLibrary(panel, opts = {}) {
       prompt[String(id++)] = { class_type: CREATE_NAME, inputs };
     }
     createBtn.disabled = true;
+    createDownloadBtn.disabled = true;
     try {
       // Core's own queue route: no pack token involved, and ComfyUI manages
       // the VAEs' memory as for any workflow.
@@ -3672,7 +3709,7 @@ export function openLibrary(panel, opts = {}) {
         const errs = Object.values(d.node_errors || {}).flatMap((n) => (n.errors || []).map((e) => e.message || e.details || ""));
         throw new Error((d.error && (d.error.message || d.error)) + (errs.length ? ": " + errs.join("; ") : ""));
       }
-      jobs.unshift({ prompt_id: d.prompt_id, names, status: "queued", msg: `#${d.number} in the queue`, progress: 0, saved: [] });
+      jobs.unshift({ prompt_id: d.prompt_id, names, status: "queued", msg: `#${d.number} in the queue`, progress: 0, saved: [], download });
       hook(); watchJob(d.prompt_id); paintJobs();
       subjectName = appearanceText = voiceText = retainedText = "";   // these belong to the RefMod just made
       toast(`Queued ${names.length === 1 ? names[0] : `${names.length} RefMods`}`);
@@ -3717,6 +3754,7 @@ export function openLibrary(panel, opts = {}) {
       if (!voiceTrimmed(plan.newVoice) && dur > cap + 0.05) toast(`Keeping the first ${cap} s of the ${dur.toFixed(1)} s voice — "Voice seconds" sets the limit`, 6000);
     }
     createBtn.disabled = true;
+    createDownloadBtn.disabled = true;
     try {
       const r = await api.fetchApi("/prompt", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, client_id: api.clientId }) });
@@ -3750,6 +3788,13 @@ export function openLibrary(panel, opts = {}) {
     execution_success: async (e) => {
       if (inspectEvent("success", e)) return;
       const j = jobs.find((x) => x.prompt_id === e.detail?.prompt_id); if (!j) return;
+      if (j.download && !j.downloadStarted) {
+        j.downloadStarted = true;
+        for (const file of savedTensors(j)) {
+          const link = downloadLink(file);
+          document.body.append(link); link.click(); link.remove();
+        }
+      }
       j.status = "done"; j.msg = `saved ${j.saved.length} file${j.saved.length === 1 ? "" : "s"}`; j.progress = 1; paintJobs();
       if (j.frames) {
         await load(true);
@@ -3779,9 +3824,18 @@ export function openLibrary(panel, opts = {}) {
   };
   function hook() { if (hooked) return; hooked = true; for (const [k, f] of Object.entries(onEvt)) api.addEventListener(k, f); }
   function unhook() { if (!hooked) return; hooked = false; for (const [k, f] of Object.entries(onEvt)) api.removeEventListener(k, f); }
+  function savedTensors(job) {
+    return [...new Set(job.saved.filter((file) => /\.safetensors$/i.test(file)))];
+  }
+  function downloadLink(file) {
+    return el("a", { class: "mmr-btn mmr-sm",
+      href: api.apiURL(`/minimax_h3/refmods/download?name=${encodeURIComponent(file)}`),
+      download: file.split("/").pop() }, `Download ${file.split("/").pop()}`);
+  }
   function paintJobs() {
     setChildren(jobsEl, jobs.slice(0, 6).map((j) => el("div", { class: `mmr-job ${j.status}` },
       el("div", { class: "mmr-jobhead" }, el("span", {}, j.names.join(", ")), el("span", { class: "mmr-dim" }, j.msg)),
+      j.status === "done" && j.download ? el("div", { class: "mmr-crow" }, savedTensors(j).map(downloadLink)) : null,
       j.status === "running" ? el("div", { class: "mmr-bar2" }, el("div", { style: { width: `${Math.round(j.progress * 100)}%` } })) : null)));
     paintFramesBtn();
   }
@@ -3885,7 +3939,7 @@ app.registerExtension({
       };
       return;
     }
-    if (nodeData.name !== STACK_NAME) return;
+    if (!STACK_NAMES.has(nodeData.name)) return;
 
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {

@@ -111,5 +111,96 @@ class RouteTokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.data["token_required"])
 
 
+
+class RefModDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_is_attachment_and_stays_in_library(self):
+        import tempfile
+        from unittest.mock import patch
+        refmods = load_module(f"{PACKAGE}.refmods", ROOT / "refmods.py")
+        handler = routes.gets["/minimax_h3/refmods/download"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "library"
+            root.mkdir()
+            (root / "hero.safetensors").write_bytes(b"refmod")
+            (Path(directory) / "outside.safetensors").write_bytes(b"private")
+            with patch.object(refmods, "search_dirs", return_value=[str(root)]), patch.object(
+                web_api.web, "FileResponse", create=True,
+                side_effect=lambda path, headers: FakeResponse(path, headers=headers)
+            ):
+                request = FakeRequest()
+                request.query = {"name": "hero.safetensors"}
+                response = await handler(request)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(Path(response.data), root / "hero.safetensors")
+                self.assertTrue(response.headers["Content-Disposition"].startswith("attachment;"))
+                for name in ["../outside.safetensors", str(Path(directory) / "outside.safetensors"),
+                             "missing.safetensors", "hero.json", "hero#0.safetensors"]:
+                    request.query = {"name": name}
+                    response = await handler(request)
+                    self.assertIn(response.status, (400, 404), name)
+
+
+class RefModUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upload_validation_collision_and_cleanup(self):
+        import json
+        import struct
+        import tempfile
+        from unittest.mock import patch
+        try:
+            import safetensors
+        except ImportError:
+            self.skipTest("safetensors is required for upload integration tests")
+        refmods = load_module(f"{PACKAGE}.refmods", ROOT / "refmods.py")
+
+        async def upload(filename, payload):
+            class Field:
+                name = "file"
+                async def read_chunk(self):
+                    chunk, self.payload = self.payload, b""
+                    return chunk
+            field = Field()
+            field.filename, field.payload = filename, payload
+            class Reader:
+                async def next(self):
+                    return field
+            request = FakeRequest({web_api.TOKEN_HEADER: web_api._TOKEN})
+            async def multipart():
+                return Reader()
+            request.multipart = multipart
+            return await routes.posts["/minimax_h3/refmods/upload"](request)
+
+        def fixture(metadata):
+            header = json.dumps({
+                "__metadata__": {"refmod_meta": json.dumps(metadata)},
+                "latent": {"dtype": "F32", "shape": [1, 24, 1, 2, 2],
+                           "data_offsets": [0, 384]},
+            }).encode()
+            header += b" " * (-len(header) % 8)
+            return struct.pack("<Q", len(header)) + header + bytes(384)
+
+        with tempfile.TemporaryDirectory() as directory:
+            paths = types.SimpleNamespace(models_dir=directory)
+            root = Path(directory) / "refmods"
+            with patch.object(web_api, "folder_paths", paths), patch.object(
+                refmods, "search_dirs", return_value=[str(root)]
+            ):
+                payload = fixture({"kind": "image", "latent_t": 1,
+                                   "latent_h": 2, "latent_w": 2})
+                first = await upload("../../hero.safetensors", payload)
+                second = await upload("../../hero.safetensors", payload)
+                self.assertEqual(first.status, 200, first.data)
+                self.assertEqual(second.status, 200, second.data)
+                self.assertNotEqual(first.data["item"]["name"], second.data["item"]["name"])
+                self.assertEqual(first.data["item"]["visual"]["kind"], "image")
+                self.assertEqual(len(list(root.rglob("*.safetensors"))), 2)
+                for filename, data in [("bad.txt", payload),
+                                       ("bad.safetensors", b"invalid"),
+                                       ("model.safetensors", fixture({})),
+                                       ("truncated.safetensors", payload[:-1])]:
+                    response = await upload(filename, data)
+                    self.assertEqual(response.status, 400, response.data)
+                self.assertEqual(len(list(root.iterdir())), 2)
+                self.assertFalse(list(root.rglob("*.part")))
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,7 +10,7 @@ import { LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL as loaderViewURL,
   overlayOn, maskOverlay, refTokenEstimate, itemLook, picturePreview, clipPreview, miniPlayer, lightbox,
   injectCSS as injectLoaderCSS } from "./medialoader.js";
 
-import { STACK_NAME, ENCODE_NAMES, readStack, deriveEntries, labelGroups,
+import { STACK_NAME, STACK_NAMES, ENCODE_NAMES, readStack, deriveEntries, labelGroups,
   rangeText as refmodRange, previewURL as refmodPreviewURL, KIND as REFMOD_KIND,
   openStackModal, refreshStackLabels } from "./refmodstack.js";
 
@@ -980,8 +980,8 @@ function modsChain(head) {
   const chain = [];
   let partial = false, n = head, guard = 0;
   while (n && guard++ < 32) {
-    if (n.type !== STACK_NAME && n.type !== NODE_NAME) { partial = true; break; }
-    if (n.type === STACK_NAME) chain.unshift(n);
+    if (!STACK_NAMES.has(n.type) && n.type !== NODE_NAME) { partial = true; break; }
+    if (STACK_NAMES.has(n.type)) chain.unshift(n);
     const up = (n.inputs || []).findIndex((i) => i.name === "mods");
     if (up < 0 || n.inputs[up].link == null) break;
     n = originNode(n, up);
@@ -6972,7 +6972,7 @@ function addRefModStack(node, { focus = true } = {}) {
   for (const enc of encoders) {
     const mi = modsInput(enc);
     const head = mi >= 0 && enc.inputs[mi].link != null ? originNode(enc, mi) : null;
-    if (head?.type === STACK_NAME) {
+    if (STACK_NAMES.has(head?.type)) {
       wire(head, 0, node, inIdx);     // slot 0 is the stack's mods bundle
       feedEncoderMedia(node, enc);
       redraw(node);

@@ -626,8 +626,23 @@ class MiniMaxH3RefModStack:
         return (rows, labels)
 
 
-NODE_CLASS_MAPPINGS = {"MiniMaxH3RefModStack": MiniMaxH3RefModStack}
-NODE_DISPLAY_NAME_MAPPINGS = {"MiniMaxH3RefModStack": "Fantastic H3 RefMod Stack"}
+class MiniMaxH3RefModUploadStack(MiniMaxH3RefModStack):
+    DESCRIPTION = (
+        "Click an empty slot to upload a .safetensors RefMod, or use Browse "
+        "library to pick a saved reference. Uploads need embedded RefMod "
+        "metadata and are saved in models/refmods. "
+        + MiniMaxH3RefModStack.DESCRIPTION
+    )
+
+
+NODE_CLASS_MAPPINGS = {
+    "MiniMaxH3RefModStack": MiniMaxH3RefModStack,
+    "MiniMaxH3RefModUploadStack": MiniMaxH3RefModUploadStack,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MiniMaxH3RefModStack": "Fantastic H3 RefMod Stack",
+    "MiniMaxH3RefModUploadStack": "Fantastic H3 RefMod Upload Stack",
+}
 
 
 # --------------------------------------------------------------------------

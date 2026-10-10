@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import time
+import tempfile
 
 from . import media_io
 
@@ -926,6 +927,95 @@ if PromptServer is not None and web is not None:
             return web.json_response(data, headers={"Cache-Control": "no-store"})
         except Exception as exc:
             return web.json_response({"error": f"scan failed: {exc}"}, status=500)
+
+    @routes.post("/minimax_h3/refmods/upload")
+    @_guard(json_only=False)
+    async def refmod_upload(request):
+        """Stream a RefMod into a unique library folder; never replace a file."""
+        from . import refmods
+        directory = path = pending = None
+        saved = False
+        try:
+            reader = await request.multipart()
+            field = await reader.next()
+            if field is None or field.name != "file" or not field.filename:
+                raise ValueError("Choose a .safetensors RefMod file")
+            if os.path.splitext(field.filename)[1].lower() != ".safetensors":
+                raise ValueError("Only .safetensors RefMod files are supported")
+            if folder_paths is None:
+                raise RuntimeError("ComfyUI model directory is unavailable")
+            root = os.path.join(folder_paths.models_dir, "refmods")
+            os.makedirs(root, exist_ok=True)
+            directory = tempfile.mkdtemp(prefix="upload_", dir=root)
+            name = _safe(field.filename.replace("\\", "/").split("/")[-1][:-12])
+            path = os.path.join(directory, name + ".safetensors")
+            pending = os.path.join(directory, "upload.part")
+            size = 0
+            with open(pending, "xb") as target:
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > 2 * 1024 ** 3:
+                        raise ValueError("RefMod uploads are limited to 2 GiB")
+                    target.write(chunk)
+            # Validate structure and offsets without loading tensors onto the GPU.
+            from safetensors import safe_open
+            try:
+                with safe_open(pending, framework="numpy") as tensors:
+                    if not list(tensors.keys()):
+                        raise ValueError("No tensors found")
+                meta, table = refmods._read_header(pending)
+                if not isinstance(meta, dict) or not (
+                    meta.get("kind") in refmods.KIND_LABEL or refmods.bundle_members(meta)
+                ):
+                    raise ValueError("Missing embedded RefMod metadata")
+                keys = ([f"ref_{i}" for i, _ in enumerate(meta["members"])]
+                        if meta.get("kind") == "bundle" else ["latent"])
+                if any(key not in table for key in keys):
+                    raise ValueError("Missing RefMod latent tensors")
+            except Exception as exc:
+                raise ValueError(
+                    "Not a supported RefMod with embedded metadata: " + str(exc)
+                ) from exc
+            os.rename(pending, path)
+            relative = os.path.basename(directory) + "/" + name
+            item = next((item for item in refmods.scan_library()["items"]
+                         if any(refmods.split_member(item[k]["file"])[0] == relative
+                                for k in ("visual", "audio") if item.get(k))), None)
+            if item is None:
+                raise ValueError("The uploaded file could not be read as a RefMod")
+            saved = True
+            return web.json_response({"item": item})
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": f"RefMod upload failed: {exc}"}, status=500)
+        finally:
+            if not saved and directory:
+                for filename in (pending, path):
+                    if filename and os.path.isfile(filename):
+                        os.remove(filename)
+                os.rmdir(directory)
+
+    @routes.get("/minimax_h3/refmods/download")
+    async def refmod_download(request):
+        """Download a saved RefMod, restricted to registered library roots."""
+        from . import refmods
+        from urllib.parse import quote
+        name = request.query.get("name", "")
+        if not name.lower().endswith(".safetensors") or "#" in name:
+            return web.json_response({"error": "Choose a .safetensors RefMod"}, status=400)
+        path = refmods.resolve_file(name[:-12], (".safetensors",))
+        if not path:
+            return web.json_response({"error": "RefMod not found"}, status=404)
+        filename = quote(os.path.basename(path), safe="")
+        return web.FileResponse(path, headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": "attachment; filename*=UTF-8''" + filename,
+            "Cache-Control": "no-store",
+        })
 
     @routes.get("/minimax_h3/refmods/preview")
     async def refmod_preview(request):
