@@ -2159,12 +2159,13 @@ export function openLibrary(panel, opts = {}) {
         if (panel) panel.refresh();
       } catch (err) { say(`Couldn't delete: ${err.message}`, true); confirmDel = false; delBtn.textContent = "Delete"; }
     } }, "Delete");
-    const saveBtn = el("button", { class: "mmr-btn primary", onclick: async () => {
+    async function saveChanges(download = false) {
       const newName = cleanName(nameIn.value), newFolder = folderIn.value.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
       if (!newName) { say("Give it a name.", true); return; }
       const target = newFolder ? `${newFolder}/${newName}` : newName;
       try {
         let renamed = false;
+        let downloadStem = files(it)[0].split("#")[0];
         const subj = subjIn.value.trim();
         if (subj && !/^[A-Za-z][\w-]{0,39}$/.test(subj)) { say("A subject name is one word: letters, digits, - and _, starting with a letter.", true); return; }
         const app = oneLine(appIn.value), voi = voiceIn ? oneLine(voiceIn.value) : (it.voice_description || "");
@@ -2182,6 +2183,7 @@ export function openLibrary(panel, opts = {}) {
             body: JSON.stringify({ files: files(it), preview: it.preview, new_name: target }) });
           const d = await r.json(); if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
           renamed = true;
+          downloadStem = d.moved[downloadStem] || downloadStem;
           if (panel) panel.state.picks.forEach((p) => {
             if (p.name !== it.name) return;
             p.name = target; p.label = newName;
@@ -2193,12 +2195,19 @@ export function openLibrary(panel, opts = {}) {
             }
           });
         }
+        if (download) {
+          const link = downloadLink(downloadStem + ".safetensors");
+          document.body.append(link); link.click(); link.remove();
+        }
         say("Saved."); toast(`Saved ${newName}`);
         view.selected = renamed ? target : it.name;
         await load(true);
         if (panel) { panel.write(); panel.refresh(); }
       } catch (err) { say(`Couldn't save: ${err.message}`, true); }
-    } }, "Save changes");
+    }
+    const saveBtn = el("button", { class: "mmr-btn primary", onclick: () => saveChanges() }, "Save changes");
+    const saveZipBtn = el("button", { class: "mmr-btn", onclick: () => saveChanges(true),
+      title: "Save changes and download a ZIP with the RefMod, preview and metadata" }, "Save changes & download ZIP");
     setChildren(inspector,
       el("div", { class: "mmr-ithumb" }, it.preview
         ? el("img", { src: previewURL(it.preview) + `&v=${it.mtime || 0}`, alt: "" })
@@ -2224,6 +2233,7 @@ export function openLibrary(panel, opts = {}) {
         el("div", { class: "mmr-irow" }, el("span", {}, "Files"), el("span", { class: "mmr-cfiles" }, files(it).join("\n")))),
       storedSection(it),
       el("div", { class: "mmr-iactions" }, saveBtn, delBtn),
+      el("div", { class: "mmr-iactions" }, saveZipBtn),
       status);
   }
 
@@ -2848,7 +2858,9 @@ export function openLibrary(panel, opts = {}) {
         (editing.copy ? ` · saved as "${copyTo}"` : "");
       budgetEl.className = "mmr-budgetline " + cls;
       budgetEl.textContent = (cls ? "⚠ " : "") + line;
-      createDownloadBtn.style.display = "none";
+      createDownloadBtn.style.display = "";
+      createDownloadBtn.textContent = editing.copy ? "Save copy & download ZIP" : "Save changes & download ZIP";
+      createDownloadBtn.disabled = blocked || (!plan.changed && !editing.copy) || !!editing.decodeError;
       createBtn.disabled = blocked || (!plan.changed && !editing.copy) || !!editing.decodeError;
       createBtn.textContent = blocked ? "Can't save" : editing.copy ? "Save as a copy" : plan.changed ? "Save changes" : "No changes";
       return;
@@ -2885,6 +2897,7 @@ export function openLibrary(panel, opts = {}) {
     budgetEl.textContent = (cls ? "⚠ " : "") + line;
     const n = u.length;
     createDownloadBtn.style.display = "";
+    createDownloadBtn.textContent = "Create & download ZIP";
     createDownloadBtn.disabled = !n || blocked;
     createBtn.disabled = !n || blocked;
     createBtn.textContent = blocked ? (taken.length ? "Name taken" : "Over the token limit")
@@ -3661,7 +3674,7 @@ export function openLibrary(panel, opts = {}) {
 
   /* ---- submit through the queue */
   async function submit(download = false) {
-    if (editing) return submitEditPlan();
+    if (editing) return submitEditPlan(download);
     const use = used();
     if (!use.length) return;
     paintBudget();
@@ -3725,7 +3738,7 @@ export function openLibrary(panel, opts = {}) {
 
   /** Save an edit: one Edit node run with the frame order, the additions
    *  and the voice change; the library rescans and reselects the file. */
-  async function submitEditPlan() {
+  async function submitEditPlan(download = false) {
     const plan = editPlan();
     paintBudget();
     if (!plan || (!plan.changed && !editing.copy) || blocked) return;
@@ -3770,7 +3783,7 @@ export function openLibrary(panel, opts = {}) {
       }
       const usedNew = used().filter((x) => !isStored(x));
       jobs.unshift({ prompt_id: d.prompt_id, names: [saveAs || editing.it.label], status: "queued", msg: `#${d.number} in the queue`,
-        progress: 0, saved: [], edit: editing.name, show: saveAs || editing.name, consumed: usedNew });
+        progress: 0, saved: [], edit: editing.name, show: saveAs || editing.name, consumed: usedNew, download });
       hook(); watchJob(d.prompt_id); paintJobs();
       toast(saveAs ? `Queued a copy as ${saveAs}` : `Queued the changes to ${editing.it.label}`);
     } catch (err) {
