@@ -2459,7 +2459,7 @@ function armTwice(btn, armedLabel, fn) {
   return btn;
 }
 const setKids = (node, kids) => node.replaceChildren(...[kids].flat(Infinity).filter((k) => k != null));
-const SAM_AUTO = "Auto (download SAM 3.1 if missing)";
+export const SAM_AUTO = "Auto (download SAM 3.1 if missing)";
 export const SAM_LINK = "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors";
 export const SAM_KEY = "mmh3.samCheckpoint";
 

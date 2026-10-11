@@ -7,7 +7,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { postApi, LOADER_NAME, INPUT_LOADER_NAME, computeTags, viewURL, openCropEditor, keepNameChars, outputTargets, setterOf,
-         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_LINK, samCheckpoints, fantasticThemeCSS } from "./medialoader.js";
+         clampScale, SCALE_MIN, SCALE_MAX, TEXT_SCALE_MAX, MASK_NODE, SAM_KEY, SAM_AUTO, samCheckpoints, fantasticThemeCSS } from "./medialoader.js";
 
 
 export const STACK_NAME = "MiniMaxH3RefModStack";
@@ -3253,7 +3253,7 @@ export function openLibrary(panel, opts = {}) {
     if (!samList) samList = await samCheckpoints();
     let saved = "";
     try { saved = localStorage.getItem(SAM_KEY) || ""; } catch (e) { /* private mode */ }
-    return samList.includes(saved) ? saved : (samList.find((c) => /sam3/i.test(c)) || "");
+    return saved === SAM_AUTO || samList.includes(saved) ? saved : (samList.find((c) => /sam3/i.test(c)) || SAM_AUTO);
   }
 
   /** The turn and mirror a source's dots were placed on. Stored frames are never turned. */
@@ -3265,14 +3265,14 @@ export function openLibrary(panel, opts = {}) {
    *  largest match unless Keep every match. True once it has run. */
   async function findSubjects(list) {
     const ckpt = await samChoice();
-    if (!ckpt || !/sam3/i.test(ckpt)) { toast("Masking needs the SAM 3.1 checkpoint in models/checkpoints — see Batch Masking", 6000); return false; }
+    if (ckpt !== SAM_AUTO && !/sam3/i.test(ckpt)) { toast("Choose Auto or a SAM 3.1 checkpoint in Batch Masking", 6000); return false; }
     // with no word, only sources with dots can be found
     list = list.filter((x) => wordOf(x) || (x.marks || []).some((m) => m.positive.length));
     if (!list.length) { toast("Type what to mask first, like person", 4000); return false; }
     const stills = list.filter((x) => x.rec.kind === "picture" && x.rec.file), clips = list.filter((x) => x.rec.kind === "video");
     const base = { model: ["1", 0], clip: ["1", 1], threshold: 0.5, subject: true };
     const most = (x) => (cfgOf(x, "subject_keep_all") ? 4 : 1);
-    const prompt = { 1: { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: ckpt } } }, targets = {};
+    const prompt = { 1: { class_type: "MiniMaxH3SAMLoader", inputs: { ckpt_name: ckpt } } }, targets = {};
     let id = 2;
     const groups = new Map();
     for (const x of stills) {
@@ -3297,6 +3297,7 @@ export function openLibrary(panel, opts = {}) {
           positive: m.positive.map(back), negative: m.negative.map(back) })) }) : "" } };
       targets[id++] = [x];
     }
+    if (ckpt === SAM_AUTO) toast("Preparing SAM 3.1; downloading if missing. Progress is shown in the ComfyUI console.", 7000);
     list.forEach((x) => { x.finding = true; });
     paintCreate();
     try {
@@ -3461,10 +3462,10 @@ export function openLibrary(panel, opts = {}) {
     const sel = el("select", { class: "mmr-sel", onchange: (e) => { try { localStorage.setItem(SAM_KEY, e.target.value); } catch (err) { /* private mode */ } } });
     const samNote = el("div", { class: "mmr-dim" });
     samChoice().then((pick) => {
-      setChildren(sel, samList.map((m) => el("option", { value: m, selected: m === pick }, m)));
-      if (!samList.some((m) => /sam3/i.test(m))) setChildren(samNote, "No SAM 3.1 checkpoint found. Put ",
-        el("a", { href: SAM_LINK, target: "_blank", rel: "noopener" }, "sam3.1_multiplex_fp16.safetensors"),
-        " in models/checkpoints; nothing is downloaded for you.");
+      setChildren(sel, [SAM_AUTO, ...samList].map((m) => el("option", { value: m, selected: m === pick }, m)));
+      if (!samList.some((m) => /sam3/i.test(m))) setChildren(samNote,
+        "SAM 3.1 will download automatically from Hugging Face when you run masking. " +
+        "Download progress appears in the ComfyUI console.");
     });
     const tried = list.filter((x) => x.subj), found = tried.filter((x) => x.subj.found).length;
     const fresh = list.filter((x) => !x.brush?.length), brushed = list.length - fresh.length;
