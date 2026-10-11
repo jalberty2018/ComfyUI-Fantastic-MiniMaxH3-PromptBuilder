@@ -628,8 +628,8 @@ class MiniMaxH3RefModStack:
 
 class MiniMaxH3RefModUploadStack(MiniMaxH3RefModStack):
     DESCRIPTION = (
-        "Click an empty slot to upload a .safetensors RefMod, or use Browse "
-        "library to pick a saved reference. Uploads need embedded RefMod "
+        "Click an empty slot to upload a RefMod ZIP archive, or use Browse "
+        "library to pick a saved reference. Uploads need embedded or archived JSON RefMod "
         "metadata and are saved in models/refmods. "
         + MiniMaxH3RefModStack.DESCRIPTION
     )

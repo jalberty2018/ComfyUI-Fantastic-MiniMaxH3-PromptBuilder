@@ -942,7 +942,7 @@ class StackPanel {
     const upload = this.node.type === UPLOAD_STACK_NAME;
     const activate = () => upload ? this.chooseUpload() : openLibrary(this);
     return el("div", { class: "mmr-slot empty", role: "button", tabindex: 0,
-      title: upload ? "Upload a .safetensors RefMod" : "Add a RefMod from the library",
+      title: upload ? "Upload a RefMod ZIP archive" : "Add a RefMod from the library",
       onclick: activate,
       onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); } } },
       this.uploading ? "Uploading…" : `refmod ${i + 1}`);
@@ -950,11 +950,11 @@ class StackPanel {
 
   chooseUpload() {
     if (this.uploading) return;
-    const input = el("input", { type: "file", accept: ".safetensors",
+    const input = el("input", { type: "file", accept: ".zip",
       onchange: async () => {
         const file = input.files?.[0];
         if (!file) return;
-        if (!/\.safetensors$/i.test(file.name)) { toast("Choose a .safetensors RefMod", 5000); return; }
+        if (!/\.zip$/i.test(file.name)) { toast("Choose a RefMod .zip archive", 5000); return; }
         this.uploading = true;
         this.render();
         try {
@@ -963,7 +963,11 @@ class StackPanel {
           const response = await postApi("/minimax_h3/refmods/upload", { body });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
-          this.add(data.item);
+          const items = data.items || [data.item];
+          const available = SLOTS - this.state.picks.length;
+          for (const item of items.slice(0, available)) this.add(item);
+          if (items.length > available)
+            toast("Uploaded to library. Use Browse library for any items that did not fit.", 6000);
         } catch (error) {
           toast(`RefMod upload failed: ${error.message}`, 7000);
         } finally {
@@ -2570,7 +2574,7 @@ export function openLibrary(panel, opts = {}) {
   const budgetEl = el("div", { class: "mmr-budgetline" });
   const createBtn = el("button", { class: "mmr-btn primary", onclick: () => submit() }, "Create");
   const createDownloadBtn = el("button", { class: "mmr-btn", onclick: () => submit(true),
-    title: "Create the RefMod in the library and download its .safetensors file" }, "Create & download .safetensors");
+    title: "Create the RefMod in the library and download a ZIP with its tensors, preview and metadata" }, "Create & download ZIP");
   const pullSel = el("select", { class: "mmr-sel", "aria-label": "Pull from a Media Loader" });
   // Click target only: drops are taken by the whole dialog (see below).
   const drop = el("div", { class: "mmr-drop", onclick: () => dropIn.click() },
@@ -3825,12 +3829,18 @@ export function openLibrary(panel, opts = {}) {
   function hook() { if (hooked) return; hooked = true; for (const [k, f] of Object.entries(onEvt)) api.addEventListener(k, f); }
   function unhook() { if (!hooked) return; hooked = false; for (const [k, f] of Object.entries(onEvt)) api.removeEventListener(k, f); }
   function savedTensors(job) {
-    return [...new Set(job.saved.filter((file) => /\.safetensors$/i.test(file)))];
+    // A look/voice pair is already included together in either archive.
+    const files = new Map();
+    for (const file of job.saved.filter((file) => /\.safetensors$/i.test(file))) {
+      const key = file.replace(/(?:_visual|_audio|_Video|_Audio)?\.safetensors$/i, "");
+      if (!files.has(key)) files.set(key, file);
+    }
+    return [...files.values()];
   }
   function downloadLink(file) {
     return el("a", { class: "mmr-btn mmr-sm",
       href: api.apiURL(`/minimax_h3/refmods/download?name=${encodeURIComponent(file)}`),
-      download: file.split("/").pop() }, `Download ${file.split("/").pop()}`);
+      download: file.split("/").pop().replace(/\.safetensors$/i, ".zip") }, `Download ${file.split("/").pop().replace(/\.safetensors$/i, ".zip")}`);
   }
   function paintJobs() {
     setChildren(jobsEl, jobs.slice(0, 6).map((j) => el("div", { class: `mmr-job ${j.status}` },

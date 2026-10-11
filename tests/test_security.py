@@ -112,6 +112,17 @@ class RouteTokenTests(unittest.IsolatedAsyncioTestCase):
 
 
 
+class FakeStreamResponse(FakeResponse):
+    def __init__(self, headers):
+        super().__init__(b"", headers=headers)
+    async def prepare(self, request):
+        pass
+    async def write(self, data):
+        self.data += data
+    async def write_eof(self):
+        pass
+
+
 class RefModDownloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_is_attachment_and_stays_in_library(self):
         import tempfile
@@ -122,16 +133,21 @@ class RefModDownloadTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory) / "library"
             root.mkdir()
             (root / "hero.safetensors").write_bytes(b"refmod")
+            (root / "hero.png").write_bytes(b"preview")
+            (root / "hero.json").write_bytes(b"{}")
             (Path(directory) / "outside.safetensors").write_bytes(b"private")
             with patch.object(refmods, "search_dirs", return_value=[str(root)]), patch.object(
-                web_api.web, "FileResponse", create=True,
-                side_effect=lambda path, headers: FakeResponse(path, headers=headers)
+                web_api.web, "StreamResponse", create=True, side_effect=FakeStreamResponse
             ):
                 request = FakeRequest()
                 request.query = {"name": "hero.safetensors"}
                 response = await handler(request)
                 self.assertEqual(response.status, 200)
-                self.assertEqual(Path(response.data), root / "hero.safetensors")
+                import io, zipfile
+                with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
+                    self.assertEqual(archive.read("hero.safetensors"), b"refmod")
+                    self.assertEqual(archive.read("hero.png"), b"preview")
+                    self.assertEqual(archive.read("hero.json"), b"{}")
                 self.assertTrue(response.headers["Content-Disposition"].startswith("attachment;"))
                 for name in ["../outside.safetensors", str(Path(directory) / "outside.safetensors"),
                              "missing.safetensors", "hero.json", "hero#0.safetensors"]:
@@ -186,14 +202,24 @@ class RefModUploadTests(unittest.IsolatedAsyncioTestCase):
             ):
                 payload = fixture({"kind": "image", "latent_t": 1,
                                    "latent_h": 2, "latent_w": 2})
-                first = await upload("../../hero.safetensors", payload)
-                second = await upload("../../hero.safetensors", payload)
+                import io, zipfile
+                def archive_bytes(entries):
+                    output = io.BytesIO()
+                    with zipfile.ZipFile(output, "w") as archive:
+                        for name, value in entries.items():
+                            archive.writestr(name, value)
+                    return output.getvalue()
+                zipped = archive_bytes({"hero.safetensors": payload})
+                first = await upload("../../hero.zip", zipped)
+                second = await upload("../../hero.zip", zipped)
                 self.assertEqual(first.status, 200, first.data)
                 self.assertEqual(second.status, 200, second.data)
                 self.assertNotEqual(first.data["item"]["name"], second.data["item"]["name"])
                 self.assertEqual(first.data["item"]["visual"]["kind"], "image")
                 self.assertEqual(len(list(root.rglob("*.safetensors"))), 2)
                 for filename, data in [("bad.txt", payload),
+                                       ("hero.safetensors", payload),
+                                       ("bad.zip", b"invalid"),
                                        ("bad.safetensors", b"invalid"),
                                        ("model.safetensors", fixture({})),
                                        ("truncated.safetensors", payload[:-1])]:
@@ -201,6 +227,46 @@ class RefModUploadTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.status, 400, response.data)
                 self.assertEqual(len(list(root.iterdir())), 2)
                 self.assertFalse(list(root.rglob("*.part")))
+                response = await upload("hero.zip", archive_bytes({
+                    "hero.safetensors": payload, "hero.png": b"preview", "hero.json": b"{}"
+                }))
+                self.assertEqual(response.status, 200, response.data)
+                item = response.data["item"]
+                self.assertIsNotNone(item["preview"])
+                request = FakeRequest()
+                request.query = {"name": item["visual"]["file"] + ".safetensors"}
+                with patch.object(web_api.web, "StreamResponse", create=True, side_effect=FakeStreamResponse):
+                    downloaded = await routes.gets["/minimax_h3/refmods/download"](request)
+                restored = await upload("restored.zip", downloaded.data)
+                self.assertEqual(restored.status, 200, restored.data)
+                self.assertIsNotNone(restored.data["item"]["preview"])
+                paired = await upload("pair.zip", archive_bytes({
+                    "pair_visual.safetensors": payload,
+                    "pair_audio.safetensors": fixture({"kind": "audio", "latent_t": 1}),
+                    "pair.png": b"shared preview",
+                }))
+                self.assertEqual(paired.status, 200, paired.data)
+                self.assertEqual(len(paired.data["items"]), 1)
+                request.query = {"name": paired.data["item"]["visual"]["file"] + ".safetensors"}
+                with patch.object(web_api.web, "StreamResponse", create=True, side_effect=FakeStreamResponse):
+                    pair_download = await routes.gets["/minimax_h3/refmods/download"](request)
+                with zipfile.ZipFile(io.BytesIO(pair_download.data)) as archive:
+                    self.assertEqual(len(archive.namelist()), 3)
+                    self.assertTrue(any(n.endswith("pair_audio.safetensors") for n in archive.namelist()))
+                sidecar = await upload("sidecar.zip", archive_bytes({
+                    "legacy.safetensors": fixture(None),
+                    "legacy.json": json.dumps({"kind": "image", "latent_t": 1,
+                                                "latent_h": 2, "latent_w": 2}).encode(),
+                }))
+                self.assertEqual(sidecar.status, 200, sidecar.data)
+                count = len(list(root.iterdir()))
+                for entries in [{"../escape.json": b"{}"}, {"/escape.json": b"{}"},
+                                {"C:/escape.json": b"{}"}, {"run.py": b"pass"},
+                                {"bad.safetensors": b"invalid"}]:
+                    response = await upload("bad.zip", archive_bytes(entries))
+                    self.assertEqual(response.status, 400, response.data)
+                    self.assertEqual(len(list(root.iterdir())), count)
+
 
 if __name__ == "__main__":
     unittest.main()

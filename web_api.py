@@ -9,6 +9,10 @@ import re
 import secrets
 import time
 import tempfile
+import zipfile
+import shutil
+import ntpath
+from pathlib import Path
 
 from . import media_io
 
@@ -39,6 +43,55 @@ TOKEN_HEADER = "X-MiniMaxH3-Token"
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 VIDEO_EXT = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpg", ".mpeg"}
 AUDIO_EXT = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+
+
+def _extract_refmod_archive(source, directory):
+    """Extract only portable RefMod assets with bounded size and safe paths."""
+    allowed = {".safetensors", ".json", ".png", ".jpg", ".jpeg", ".webp"}
+    try:
+        with zipfile.ZipFile(source) as archive:
+            members = archive.infolist()
+            if len(members) > 256 or sum(m.file_size for m in members) > 2 * 1024 ** 3:
+                raise ValueError("Archive exceeds 256 entries or 2 GiB unpacked")
+            seen = set()
+            for member in members:
+                name = member.filename.replace("\\", "/")
+                parts = name.rstrip("/").split("/")
+                if (ntpath.splitdrive(name)[0] or name.startswith("/")
+                        or any(p in ("", ".", "..") or ":" in p or p.endswith((" ", ".")) for p in parts)
+                        or ((member.external_attr >> 16) & 0o170000) == 0o120000):
+                    raise ValueError("Unsafe archive path")
+                if member.is_dir():
+                    continue
+                if os.path.splitext(name)[1].lower() not in allowed or name.lower() in seen:
+                    raise ValueError("Unsupported or duplicate archive entry")
+                seen.add(name.lower())
+                target = os.path.join(directory, *parts)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(member) as src, open(target, "xb") as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("Invalid ZIP archive") from exc
+
+
+def _validate_refmod(path):
+    from . import refmods
+    from safetensors import safe_open
+    try:
+        with safe_open(path, framework="numpy") as tensors:
+            if not list(tensors.keys()):
+                raise ValueError("No tensors found")
+        meta, table = refmods.read_meta(path[:-12])
+        if not isinstance(meta, dict) or not (
+            meta.get("kind") in refmods.KIND_LABEL or refmods.bundle_members(meta)
+        ):
+            raise ValueError("Missing RefMod metadata (embedded or JSON sidecar)")
+        keys = ([f"ref_{i}" for i, _ in enumerate(meta["members"])]
+                if meta.get("kind") == "bundle" else ["latent"])
+        if any(key not in table for key in keys):
+            raise ValueError("Missing RefMod latent tensors")
+    except Exception as exc:
+        raise ValueError("Not a supported RefMod: " + str(exc)) from exc
 
 
 def kind_for(name):
@@ -933,22 +986,20 @@ if PromptServer is not None and web is not None:
     async def refmod_upload(request):
         """Stream a RefMod into a unique library folder; never replace a file."""
         from . import refmods
-        directory = path = pending = None
+        directory = pending = None
         saved = False
         try:
             reader = await request.multipart()
             field = await reader.next()
             if field is None or field.name != "file" or not field.filename:
-                raise ValueError("Choose a .safetensors RefMod file")
-            if os.path.splitext(field.filename)[1].lower() != ".safetensors":
-                raise ValueError("Only .safetensors RefMod files are supported")
+                raise ValueError("Choose a RefMod .zip archive")
+            if os.path.splitext(field.filename)[1].lower() != ".zip":
+                raise ValueError("Only RefMod .zip archives are supported")
             if folder_paths is None:
                 raise RuntimeError("ComfyUI model directory is unavailable")
             root = os.path.join(folder_paths.models_dir, "refmods")
             os.makedirs(root, exist_ok=True)
             directory = tempfile.mkdtemp(prefix="upload_", dir=root)
-            name = _safe(field.filename.replace("\\", "/").split("/")[-1][:-12])
-            path = os.path.join(directory, name + ".safetensors")
             pending = os.path.join(directory, "upload.part")
             size = 0
             with open(pending, "xb") as target:
@@ -960,44 +1011,29 @@ if PromptServer is not None and web is not None:
                     if size > 2 * 1024 ** 3:
                         raise ValueError("RefMod uploads are limited to 2 GiB")
                     target.write(chunk)
-            # Validate structure and offsets without loading tensors onto the GPU.
-            from safetensors import safe_open
-            try:
-                with safe_open(pending, framework="numpy") as tensors:
-                    if not list(tensors.keys()):
-                        raise ValueError("No tensors found")
-                meta, table = refmods._read_header(pending)
-                if not isinstance(meta, dict) or not (
-                    meta.get("kind") in refmods.KIND_LABEL or refmods.bundle_members(meta)
-                ):
-                    raise ValueError("Missing embedded RefMod metadata")
-                keys = ([f"ref_{i}" for i, _ in enumerate(meta["members"])]
-                        if meta.get("kind") == "bundle" else ["latent"])
-                if any(key not in table for key in keys):
-                    raise ValueError("Missing RefMod latent tensors")
-            except Exception as exc:
-                raise ValueError(
-                    "Not a supported RefMod with embedded metadata: " + str(exc)
-                ) from exc
-            os.rename(pending, path)
-            relative = os.path.basename(directory) + "/" + name
-            item = next((item for item in refmods.scan_library()["items"]
-                         if any(refmods.split_member(item[k]["file"])[0] == relative
-                                for k in ("visual", "audio") if item.get(k))), None)
-            if item is None:
+            _extract_refmod_archive(pending, directory)
+            os.remove(pending)
+            tensors = list(Path(directory).rglob("*.safetensors"))
+            if not tensors:
+                raise ValueError("Archive contains no .safetensors RefMods")
+            for tensor in tensors:
+                _validate_refmod(str(tensor))
+            prefix = os.path.basename(directory) + "/"
+            items = [item for item in refmods.scan_library()["items"]
+                     if item["name"].startswith(prefix)]
+            if not items:
                 raise ValueError("The uploaded file could not be read as a RefMod")
+            if len(items) > 12:
+                raise ValueError("An archive can contain at most 12 RefMods")
             saved = True
-            return web.json_response({"item": item})
+            return web.json_response({"item": items[0], "items": items})
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception as exc:
             return web.json_response({"error": f"RefMod upload failed: {exc}"}, status=500)
         finally:
             if not saved and directory:
-                for filename in (pending, path):
-                    if filename and os.path.isfile(filename):
-                        os.remove(filename)
-                os.rmdir(directory)
+                shutil.rmtree(directory)
 
     @routes.get("/minimax_h3/refmods/download")
     async def refmod_download(request):
@@ -1010,12 +1046,38 @@ if PromptServer is not None and web is not None:
         path = refmods.resolve_file(name[:-12], (".safetensors",))
         if not path:
             return web.json_response({"error": "RefMod not found"}, status=404)
-        filename = quote(os.path.basename(path), safe="")
-        return web.FileResponse(path, headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Disposition": "attachment; filename*=UTF-8''" + filename,
-            "Cache-Control": "no-store",
-        })
+        stem = name[:-12]
+        item = next((item for item in refmods.scan_library()["items"]
+                     if any(refmods.split_member(item[k]["file"])[0] == stem
+                            for k in ("visual", "audio") if item.get(k))), None)
+        stems = {stem}
+        if item:
+            stems.update(refmods.split_member(item[k]["file"])[0]
+                         for k in ("visual", "audio") if item.get(k))
+            stems.add(item["name"])
+            if item.get("preview"):
+                stems.add(item["preview"])
+        filename = quote(os.path.basename(item["name"] if item else stem) + ".zip", safe="")
+        with tempfile.TemporaryFile() as archive:
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                included = set()
+                for member in sorted(stems):
+                    for ext in (".safetensors", ".json") + refmods.PREVIEW_EXT:
+                        source = refmods.resolve_file(member, (ext,))
+                        if source and source not in included:
+                            bundle.write(source, member + ext)
+                            included.add(source)
+            archive.seek(0)
+            response = web.StreamResponse(headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": "attachment; filename*=UTF-8''" + filename,
+                "Cache-Control": "no-store",
+            })
+            await response.prepare(request)
+            while chunk := archive.read(1024 * 1024):
+                await response.write(chunk)
+            await response.write_eof()
+            return response
 
     @routes.get("/minimax_h3/refmods/preview")
     async def refmod_preview(request):
